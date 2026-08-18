@@ -141,6 +141,8 @@ vite.config.ts.timestamp-*
 infra/relay/relay.toml
 infra/.env
 infra/data/
+# Local ops tooling (hardcoded machine-specific paths, not portable app code)
+infra/scripts/
 !infra/data/backups/.gitkeep
 
 # Python
