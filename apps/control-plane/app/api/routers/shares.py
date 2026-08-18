@@ -124,6 +124,29 @@ def _get_minio_client() -> Minio:
     )
 
 
+def _get_minio_public_client() -> Minio:
+    """MinIO client used ONLY to generate presigned URLs for external clients
+    (e.g. the Obsidian plugin's upload/download). minio_endpoint is typically a
+    Docker-internal hostname (e.g. "minio:9000") that only control-plane can
+    resolve — a presigned URL built against it is dead on arrival for anything
+    outside the Docker network. This client points at minio_public_endpoint
+    instead (falls back to minio_endpoint if unset, e.g. for non-containerized
+    deployments where they're the same). Never used for direct calls
+    (stat_object, bucket creation, etc.) — those still go through
+    _get_minio_client()."""
+    settings = get_settings()
+    return Minio(
+        settings.minio_public_endpoint or settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=(
+            settings.minio_public_secure
+            if settings.minio_public_endpoint
+            else settings.minio_secure
+        ),
+    )
+
+
 def _ensure_minio_bucket(client: Minio, bucket_name: str) -> None:
     try:
         if not client.bucket_exists(bucket_name):
@@ -425,7 +448,7 @@ def get_file_download_url(
         # Confirm the object exists before minting the URL — a presigned GET
         # for a missing key 404s opaquely from MinIO, not from this API.
         minio_client.stat_object(settings.minio_bucket, object_name)
-        url = minio_client.presigned_get_object(
+        url = _get_minio_public_client().presigned_get_object(
             settings.minio_bucket, object_name, expires=timedelta(minutes=10)
         )
     except S3Error as e:
@@ -465,7 +488,7 @@ def get_file_upload_url(
     _ensure_minio_bucket(minio_client, settings.minio_bucket)
     object_name = f"web-assets/{share_id}/{path}"
     content_type = token_payload.get("content_type") or "application/octet-stream"
-    url = minio_client.presigned_put_object(
+    url = _get_minio_public_client().presigned_put_object(
         settings.minio_bucket, object_name, expires=timedelta(minutes=10)
     )
 

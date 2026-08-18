@@ -191,6 +191,19 @@ class Settings(BaseSettings):
     minio_secret_key: str = Field(default="minioadmin", description="MinIO secret key")
     minio_secure: bool = Field(default=False, description="Use TLS for MinIO")
     minio_bucket: str = Field(default="relay-assets", description="MinIO bucket name")
+    # Endpoint baked into presigned upload/download URLs handed to external clients
+    # (e.g. the Obsidian plugin). Must be reachable from OUTSIDE the Docker network —
+    # minio_endpoint above is typically a Docker-internal hostname (e.g. "minio:9000")
+    # that only control-plane itself can resolve. Falls back to minio_endpoint/
+    # minio_secure when unset, which only works if minio_endpoint is itself already
+    # externally reachable.
+    minio_public_endpoint: str | None = Field(
+        default=None,
+        description="Externally-reachable MinIO endpoint for presigned URLs (host:port, no scheme)",
+    )
+    minio_public_secure: bool = Field(
+        default=True, description="Use TLS for the public MinIO endpoint"
+    )
 
     # Lifecycle email nudge engine
     lifecycle_enabled: bool = Field(
