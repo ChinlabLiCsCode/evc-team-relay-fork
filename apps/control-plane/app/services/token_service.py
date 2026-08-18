@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
@@ -127,13 +128,22 @@ def issue_relay_token(
     key_id = request.app.state.relay_key_id
     relay_url = str(settings.relay_public_url).rstrip("/")
 
+    # The CWT `aud` claim must byte-for-byte match relay-server's relay.toml
+    # [server].url: origin only (scheme+host, no path), always https://. This is
+    # NOT simply RELAY_PUBLIC_URL with the scheme swapped — RELAY_PUBLIC_URL keeps
+    # a /doc/ws path that the client needs (see RELAY_PUBLIC_URL's comment in .env),
+    # so the path has to be dropped here rather than carried through.
+    parsed = urlsplit(relay_url)
+    aud_scheme = "https" if parsed.scheme in ("wss", "https") else "http"
+    audience = f"{aud_scheme}://{parsed.netloc}"
+
     token = security.create_relay_token_cwt(
         private_key=private_key,
         key_id=key_id,
         doc_id=payload.doc_id,
         mode=payload.mode.value,
         expires_minutes=settings.relay_token_ttl_minutes,
-        audience=relay_url,
+        audience=audience,
         share_id=str(share.id),
     )
 

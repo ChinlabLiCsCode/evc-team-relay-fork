@@ -239,7 +239,14 @@ def create_relay_token_cwt(
     mode: str,
     expires_minutes: int,
     audience: str | None = None,
-    issuer: str = "relay-control-plane",
+    # relay-server hardcodes an issuer allowlist (crates/y-sweet-core/src/auth.rs
+    # VALID_ISSUERS: "relay-server", "auth.system3.dev", "auth.system3.md") that was
+    # never updated for a self-hosted control-plane's own issuer identity — any other
+    # value, including the "relay-control-plane" this used to default to, is rejected
+    # with AuthError::InvalidClaims regardless of signature/audience validity. Since
+    # relay-server is a closed-source image we can't patch, use the accepted value
+    # closest to our own identity. Confirmed 2026-08-17.
+    issuer: str = "relay-server",
     share_id: str | None = None,
 ) -> str:
     """Create CWT (CBOR Web Token) for relay-server authentication.
@@ -267,16 +274,27 @@ def create_relay_token_cwt(
     - Because there is no jti/revocation-list, remove_member cannot invalidate a
       token already handed to the ex-member — settings.relay_token_ttl_minutes (see
       config.py) is the only lever bounding that exposure window (TR-22, #f63a2bea).
-    - aud is omitted: y-sweet rejects tokens with the aud claim.
+    - aud (CWT_CLAIM_AUD) is included when `audience` is given, and MUST equal
+      relay-server's relay.toml [server].url exactly (scheme included) — relay-server
+      rejects tokens with no matching aud claim once [server].url is configured
+      (crates/specs/cwt-audience-claim-support.md). This reverses the previous
+      "y-sweet rejects tokens with the aud claim" assumption.
+    - key_id (COSE `kid` header) is NEVER emitted — see the "y-sweet does NOT include
+      kid" note above. relay.toml's [[auth]] entries must likewise omit `key_id`, or
+      relay-server routes kid-less tokens to an empty fallback key list and rejects
+      them with AuthError::KeyMismatch regardless of whether the key itself is right
+      (crates/y-sweet-core/src/auth.rs from_multi_key_config / find_verifying_key).
 
     Args:
         private_key: Ed25519 private key object
-        key_id: Key identifier for COSE header (kid)
+        key_id: Unused — retained for call-site compatibility; see note above
         doc_id: Document ID for relay access
         mode: Access mode ("read" or "write")
         expires_minutes: Token TTL in minutes
-        audience: Relay server URL (reserved, not added to claims — y-sweet rejects aud)
-        issuer: Token issuer (default: "relay-control-plane")
+        audience: Relay server's relay.toml [server].url (scheme+host, no path) —
+            added as the CWT aud claim when given
+        issuer: Token issuer — must be one of relay-server's hardcoded VALID_ISSUERS
+            (default: "relay-server"); see note above
         share_id: Share UUID the token was issued against (added as CWT_CLAIM_SHARE)
 
     Returns:
@@ -294,6 +312,15 @@ def create_relay_token_cwt(
         CWT_CLAIM_EXP: int((now + timedelta(minutes=expires_minutes)).timestamp()),
         CWT_CLAIM_SCOPE: scope,
     }
+
+    # relay-server (crates/y-sweet-core/src/cwt.rs, spec: cwt-audience-claim-support.md)
+    # rejects every token with AuthError::KeyMismatch / MissingAudience when its
+    # relay.toml has [server].url set and the token carries no matching `aud` claim —
+    # this became mandatory after that spec landed; the old "y-sweet rejects tokens
+    # with the aud claim" assumption this parameter's docstring describes predates it
+    # and is no longer true as of relay-server 0.9.7. Confirmed 2026-08-17.
+    if audience:
+        claims[CWT_CLAIM_AUD] = audience
 
     # Bind token to the issuing share — confused-deputy mitigation (H6).
     # Full enforcement requires relay-server (System3) to validate this claim.

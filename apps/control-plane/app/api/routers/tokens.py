@@ -16,7 +16,13 @@ limiter = Limiter(key_func=get_remote_address)
 
 
 @router.post("/relay", response_model=token_schema.RelayTokenResponse)
-@limiter.limit("30/minute")  # Max 30 token requests per minute per IP
+# All traffic arrives via `tailscale serve` (see infra/docker-compose.yml), which does not
+# preserve the original client address, so get_remote_address sees one shared IP for every
+# device on the tailnet — this limit was effectively "30/minute for the whole lab", not per
+# device. A folder with many per-file docs (e.g. otherTypes enabled on a large attachment
+# folder) can burn through that on its own, 429ing every other device's legitimate doc
+# reconnects too. Raised substantially; still bounds a truly runaway client. 2026-08-18.
+@limiter.limit("600/minute")
 def issue_relay_token(
     request: Request,
     payload: token_schema.RelayTokenRequest,
