@@ -1,19 +1,132 @@
+# Team Relay ingress config.
+#
+# This file targets the DEFAULT deployment: this host owns its public IP and
+# terminates TLS itself, so Caddy manages certificates automatically for the
+# domains below.
+#
+# ── Running behind a TLS-terminating reverse proxy / CDN ────────────────────
+# If something in front of this host already terminates TLS and forwards plain
+# HTTP (a cloud LB, a shared edge Caddy/nginx, Cloudflare in "flexible" mode),
+# THREE changes are required — and the first one is not optional:
+#
+#   1. Prefix every site address below with `http://`
+#      (`http://cp.{$DOMAIN_BASE} {`, `http://{$DOMAIN_BASE} {`, ...).
+#      Without the scheme Caddy binds the site to :443 and tries to obtain a
+#      certificate; a proxy that only forwards to :80 then matches no site and
+#      the domain answers with an empty 200. This exact omission took our
+#      control-plane domain down for hours.
+#   2. Optionally add `auto_https off` to the global block above as a guard, so
+#      a site block added later WITHOUT the `http://` prefix cannot silently
+#      re-introduce (1).
+#   3. Make sure the proxy in front sets HSTS, or keep `import security_headers`
+#      here — headers set on a plain-HTTP hop still reach the client through
+#      the proxy, which is why they are imported per-site below.
+#
+# Do NOT apply these on a normal public-IP install: `http://` there means the
+# service is served over plaintext with no certificate at all.
 {
   email {$ACME_EMAIL}
 }
 
+(security_headers) {
+  header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  header X-Content-Type-Options "nosniff"
+}
+
+# Kept separate from security_headers on purpose: the web-publish host below
+# must stay embeddable in an iframe, so it imports security_headers WITHOUT
+# this one. Merging the two would silently break embedding.
+(no_framing) {
+  header X-Frame-Options "DENY"
+}
+
+(access_log_redacted) {
+  # A site block with no `log` directive gets zero access-log entries, ever
+  # (Caddy's Caddyfile adapter puts undeclared hosts in `logs.skip_hosts`) —
+  # not "logs but drops WS upgrades", just no log at all for that host. Bit
+  # us in prod: cp.{$DOMAIN_BASE} and {$DOMAIN_BASE} had no `log` block, so
+  # 7 days of real relay-server WS traffic (confirmed via its own metrics)
+  # showed as zero requests in Caddy — looked like dead traffic, wasn't.
+  # Redact `token`/`agent_key` query params — both are live-session secrets
+  # (CWT token, share agent key) and must not land in shipped logs.
+  log {
+    format filter {
+      wrap json
+      fields {
+        request>uri query {
+          replace token REDACTED
+          replace agent_key REDACTED
+        }
+      }
+    }
+  }
+}
+
 cp.{$DOMAIN_BASE} {
+  import security_headers
+  import no_framing
+  import access_log_redacted
+
+  # TR-47: /metrics must never be reachable on the public edge — it is the
+  # unauthenticated Prometheus scrape surface (route templates + counters,
+  # confirmed no PII, but still should never be public). Internal scraping
+  # goes through a separate firewall-locked metrics-proxy on :9300
+  # (docker-compose.override.yml), unaffected by this block.
   handle /metrics* {
     respond 404
+  }
+
+  # Cheap guard against oversized bodies. Deliberately far looser than any
+  # real endpoint needs: the only upload route (branding logo/favicon) caps
+  # itself at 1MB in the application, and the largest body observed on our
+  # own prod over 30 days was ~190KB across 112k requests, with zero 413s.
+  # Note this is a read-time guard: Caddy answers 413 when the upstream reads
+  # past the limit, so an upstream that ignores the body still sees the
+  # request. Verified: 11MB -> 413, 1MB -> 200.
+  request_body {
+    max_size 10MB
   }
   reverse_proxy control-plane:8000 {
     # Force Connection: close to prevent stale keep-alive sockets
     # (Electron/httpx reuse idle connections that Caddy already closed)
     header_down Connection close
+
+    # TR-infra 5/6 (#5dca467c): `docker compose up -d --force-recreate
+    # control-plane` (scripts/deploy.sh) kills the old container ~5s before
+    # the new one starts accepting connections (measured live 2026-08-20:
+    # kill at T+0, new container `start` event at T+5.2s) — during that gap
+    # this is the only upstream and dialing it fails outright (observed both
+    # as plain connection-refused and, per prod's real logs, Docker's
+    # embedded DNS returning SERVFAIL for the service name while the old
+    # container's registration is torn down: "server misbehaving"). Caddy
+    # returned that as an immediate 502 to whoever was mid-request — a real
+    # user hit this mid-`/shares/<id>` on 2026-08-19 (see task description).
+    #
+    # A dial failure (of either flavor above) happens before any request
+    # bytes reach the upstream, so it is always safe to retry — nothing was
+    # written that could be double-applied. lb_try_duration makes Caddy
+    # re-attempt the same upstream (there's only one) instead of failing the
+    # client request immediately; lb_try_interval keeps retries tight so a
+    # request that can succeed does so within ~1-2 retries of the container
+    # coming back, not near the full budget. 30s comfortably covers the
+    # measured ~5.2s recreate gap with margin, without masking a genuinely
+    # down backend for an unreasonable time. Live-verified end to end: a real
+    # `scripts/deploy.sh control-plane` run against this config produced
+    # ZERO 502s over 97 probe requests (health + a real /shares/<id> call,
+    # every 200ms) spanning the full recreate window — vs. 38 real 502s
+    # logged on this host over the preceding 7 days without this block,
+    # confirming the measurement method itself does detect 502s when they
+    # occur. Full writeup + raw counts: task #5dca467c.
+    lb_try_duration 30s
+    lb_try_interval 250ms
   }
 }
 
 {$DOMAIN_BASE} {
+  import security_headers
+  import no_framing
+  import access_log_redacted
+
   # Browser WebSocket API cannot set custom headers, so this rule extracts
   # ?token= and sets it as an Authorization header instead, for plain HTTP
   # endpoints that need it that way.
@@ -52,6 +165,15 @@ cp.{$DOMAIN_BASE} {
 # Set WEB_PUBLISH_DOMAIN in .env to enable (e.g., docs.example.com)
 # Default 'web-publish.disabled' is a placeholder that won't match real requests
 {$WEB_PUBLISH_DOMAIN:web-publish.disabled} {
+  # security_headers WITHOUT no_framing: published docs are meant to be
+  # embeddable, so X-Frame-Options must not be sent here. Framing is
+  # constrained by the app's own CSP `frame-ancestors` instead, which —
+  # unlike X-Frame-Options — can allow a specific origin.
+  import security_headers
+  import access_log_redacted
+  request_body {
+    max_size 10MB
+  }
   reverse_proxy web-publish:3000
 }
 

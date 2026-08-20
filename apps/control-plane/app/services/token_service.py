@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
@@ -10,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core import security
 from app.core.config import get_settings
+from app.core.metrics import RELAY_TOKENS_ISSUED_TOTAL
 from app.db import models
 from app.schemas import token as token_schema
 from app.services import audit_service, share_service
@@ -126,16 +126,6 @@ def issue_relay_token(
     # parse_claims_map + auth.rs) — separate task from TR-22, file if not already open.
     private_key = request.app.state.relay_private_key
     key_id = request.app.state.relay_key_id
-    relay_url = str(settings.relay_public_url).rstrip("/")
-
-    # The CWT `aud` claim must byte-for-byte match relay-server's relay.toml
-    # [server].url: origin only (scheme+host, no path), always https://. This is
-    # NOT simply RELAY_PUBLIC_URL with the scheme swapped — RELAY_PUBLIC_URL keeps
-    # a /doc/ws path that the client needs (see RELAY_PUBLIC_URL's comment in .env),
-    # so the path has to be dropped here rather than carried through.
-    parsed = urlsplit(relay_url)
-    aud_scheme = "https" if parsed.scheme in ("wss", "https") else "http"
-    audience = f"{aud_scheme}://{parsed.netloc}"
 
     token = security.create_relay_token_cwt(
         private_key=private_key,
@@ -143,9 +133,11 @@ def issue_relay_token(
         doc_id=payload.doc_id,
         mode=payload.mode.value,
         expires_minutes=settings.relay_token_ttl_minutes,
-        audience=audience,
+        audience=settings.effective_relay_audience,
+        issuer=settings.relay_token_issuer,
         share_id=str(share.id),
     )
+    RELAY_TOKENS_ISSUED_TOTAL.labels(mode=payload.mode.value).inc()
 
     # Log token issuance with file path for folder shares
     details = {

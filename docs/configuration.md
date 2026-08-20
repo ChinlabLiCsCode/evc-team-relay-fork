@@ -41,7 +41,11 @@ These create the first admin user when the database is empty.
 |----------|----------|---------|-------------|
 | `SERVER_NAME` | No | `EVC Team Relay` | Display name shown in plugin |
 | `SERVER_ID` | No | (auto) | Unique identifier, defaults to relay key ID |
-| `RELAY_PUBLIC_URL` | No | `wss://relay.${DOMAIN_BASE}` | Public WebSocket URL for relay server |
+| `RELAY_PUBLIC_URL` | No | `wss://${DOMAIN_BASE}/doc/ws` | Public WebSocket URL for relay server (client-facing) |
+| `RELAY_PRIVATE_KEY` | **Yes** | — | Base64-encoded Ed25519 private key used to sign relay tokens. Startup **fails closed** without it (`RELAY_PRIVATE_KEY is required but not set`) — no key is generated for you. Create it once with `openssl genpkey -algorithm ed25519 -out relay_private.pem && openssl base64 -A -in relay_private.pem`, then back it up: replacing it invalidates every token already issued and requires updating `[[auth]] public_key` in `relay.toml`. |
+| `RELAY_KEY_ID` | No | `relay_cp_dev` | COSE `kid` embedded in issued tokens; must match a `[[auth]] key_id` in `relay.toml` |
+| `RELAY_AUDIENCE` | No | derived from `RELAY_PUBLIC_URL`'s host as `https://{host}` | `aud` claim on issued tokens — must equal `relay.toml`'s `[server].url` exactly. Distinct from `RELAY_PUBLIC_URL`: that one is the wss:// client URL with a `/doc/ws` path, this must be a bare https:// origin with no path. Set explicitly only if your `[server].url` uses a different host than `RELAY_PUBLIC_URL`. |
+| `RELAY_TOKEN_ISSUER` | No | `relay-server` | `iss` claim on issued tokens. Must be one of relay-server's accepted issuers (`relay-server`, `auth.system3.dev`, `auth.system3.md` as of image `0.9.9`) — leave at the default unless you know your relay-server image accepts a different value. |
 
 ## Logging
 
@@ -209,27 +213,43 @@ The `Caddyfile` in the `infra/` directory configures Caddy as a reverse proxy wi
 
 ### WebSocket Token Proxy
 
-The relay server authenticates WebSocket connections using CWT (CBOR Web Token) tokens passed via the `Authorization: Bearer` header. However, the browser WebSocket API (`new WebSocket(url)`) does not support custom headers.
-
-To bridge this gap, Caddy extracts the `?token=` query parameter and sets it as the `Authorization` header:
+Relay server (`{$DOMAIN_BASE}` — there is no separate `relay.` subdomain) authenticates
+WebSocket connections using CWT (CBOR Web Token) tokens. For plain HTTP endpoints, since the
+browser WebSocket API (`new WebSocket(url)`) does not support custom headers, Caddy extracts
+the `?token=` query parameter and rewrites it as an `Authorization: Bearer` header. The
+WebSocket-upgrade paths are explicitly excluded from that rewrite: relay-server's own
+WS-upgrade handlers only ever read the token from the query string, never from a header
+(see [#137](https://github.com/entire-vc/evc-team-relay/pull/137)), so rewriting it there
+strips the one thing the handler checks and replaces it with the one thing it never reads:
 
 ```caddy
-relay.{$DOMAIN_BASE} {
-  @token_in_query query token=*
-  request_header @token_in_query Authorization "Bearer {query.token}"
-  reverse_proxy relay-server:8080
+{$DOMAIN_BASE} {
+  @token_in_query {
+    query token=*
+    not path /doc/ws/* /d/*/ws/*
+  }
+  handle @token_in_query {
+    route {
+      request_header Authorization "Bearer {query.token}"
+      uri query -token
+      reverse_proxy relay-server:8080
+    }
+  }
+  handle {
+    reverse_proxy relay-server:8080
+  }
 }
 ```
 
 **How it works:**
 
-1. The Obsidian plugin connects to `wss://relay.yourdomain.com/doc/ws/{docId}?token=<CWT>`
-2. Caddy sees the `?token=` query parameter and sets `Authorization: Bearer <CWT>` header
-3. The relay server receives the `Authorization` header and validates the CWT token
+1. The Obsidian plugin connects to `wss://yourdomain.com/doc/ws/{docId}?token=<CWT>`
+2. The path matches `/doc/ws/*`, so the `@token_in_query` matcher above excludes it — Caddy proxies the request through unchanged, query string intact
+3. relay-server's own verifier reads `?token=` directly and validates the CWT
 
-Both methods are supported simultaneously:
-- **`?token=` query parameter** — used by browser-based clients (Obsidian plugin)
-- **`Authorization: Bearer` header** — used by server-side clients and scripts
+For non-WS HTTP endpoints, both methods are supported:
+- **`?token=` query parameter** — rewritten to a header by Caddy, for browser-based clients that can't set one
+- **`Authorization: Bearer` header** — set directly by server-side clients and scripts
 
 ### CWT Token Format
 

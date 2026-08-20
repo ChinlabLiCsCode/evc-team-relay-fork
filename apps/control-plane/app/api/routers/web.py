@@ -26,7 +26,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core import security
+from app.core import agent_key_scopes, security
 from app.core.config import get_settings
 from app.db import models
 from app.db.session import get_db
@@ -89,19 +89,43 @@ def _require_private_web_auth(
                 if exp.tzinfo is None:
                     exp = exp.replace(tzinfo=_tz.utc)
             if exp is None or exp >= security.utcnow():
-                scopes = {s.strip() for s in agent_key.scopes.split(",") if s.strip()}
+                scopes = agent_key_scopes.parse_scopes(agent_key.scopes)
                 has_any = bool(scopes & {"read", "write"})
-                # write implies read: a write-scoped key satisfies a read requirement
-                if required_scope == "read":
-                    has_required = bool(scopes & {"read", "write"})
-                else:
-                    has_required = required_scope in scopes
+                # Single source of truth for the policy — see ADR-0001 and
+                # app/core/agent_key_scopes.py. This route family used to answer
+                # "write implies read" while /download and /files-index answered
+                # the literal question, so one key read the same document through
+                # one route and was refused it through the other (#b69d73fb).
+                has_required = agent_key_scopes.check(
+                    scopes,
+                    required_scope,
+                    grace=get_settings().agent_key_lenient_read_grace,
+                    key_id=agent_key.id,
+                    share_id=share.id,
+                    route=request.url.path,
+                )
                 if has_any and not has_required:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=f"Agent key does not have {required_scope} scope",
                     )
                 if has_any:
+                    # Record use here too. Until now only _auth_share_read_access
+                    # stamped last_used_at, so every read through this route family
+                    # was invisible in the key's usage record — which is exactly why
+                    # "is anyone reading with a write-only key?" could not be
+                    # answered from the data (#b69d73fb).
+                    #
+                    # Committed here rather than left to the caller: every route in
+                    # this family is a GET that commits nothing, so an uncommitted
+                    # stamp would be silently discarded — the same blind spot in a
+                    # new costume. Failure to record usage must never fail the
+                    # request, hence the rollback-and-continue.
+                    agent_key.last_used_at = security.utcnow()
+                    try:
+                        db.commit()
+                    except Exception:  # pragma: no cover - telemetry must not 500
+                        db.rollback()
                     return  # authenticated via agent key with sufficient scope
 
     # --- User JWT path ---
@@ -407,106 +431,6 @@ def validate_share_session(
         return WebSessionValidation(valid=is_valid, share_id=str(share.id) if is_valid else None)
     except HTTPException:
         return WebSessionValidation(valid=False, share_id=None)
-
-
-class WebRelayTokenResponse(BaseModel):
-    """Response with relay token for real-time sync."""
-
-    relay_url: str
-    token: str
-    doc_id: str
-    expires_at: datetime
-
-
-@router.get("/shares/{slug}/token", response_model=WebRelayTokenResponse)
-def get_web_relay_token(
-    slug: str,
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-) -> WebRelayTokenResponse:
-    """
-    Get a relay token for real-time sync via WebSocket.
-
-    Returns a read-only Ed25519-signed JWT token for connecting to y-sweet relay server.
-    Access is validated based on share visibility:
-    - PUBLIC: Anyone can get a token
-    - PROTECTED: Requires valid web_session cookie
-    - PRIVATE: Requires Casdoor/OAuth session (Bearer or access_token cookie) or
-               a valid ShareAgentKey with read or write scope for this share
-
-    Returns 401 if PRIVATE share and caller is unauthenticated.
-    """
-    from datetime import timedelta
-
-    settings = get_settings()
-    if not settings.web_publish_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Web publishing is not enabled on this server",
-        )
-
-    # Find share
-    stmt = select(models.Share).where(
-        models.Share.web_slug == slug,
-        models.Share.web_published == True,  # noqa: E712
-    )
-    share = db.execute(stmt).scalar_one_or_none()
-
-    if not share:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Share not found or not published",
-        )
-
-    # Check if share has doc_id for real-time sync
-    if not share.web_doc_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Real-time sync not configured for this share. Sync from Obsidian plugin first.",
-        )
-
-    # Check access based on visibility
-    if share.visibility == models.ShareVisibility.PRIVATE:
-        _require_private_web_auth(request, share, db)
-        for header_name, header_value in _private_embed_headers(settings).items():
-            response.headers[header_name] = header_value
-
-    if share.visibility == models.ShareVisibility.PROTECTED:
-        # Validate session cookie
-        session_token = request.cookies.get("web_session")
-        if not session_token:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Authentication required for protected share",
-            )
-        if not WebSessionService.validate_web_session(session_token, share.id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid or expired session",
-            )
-
-    # Generate read-only relay token
-    expires_in = timedelta(minutes=settings.relay_token_ttl_minutes)
-    expires_at = security.utcnow() + expires_in
-
-    private_key = request.app.state.relay_private_key
-    key_id = request.app.state.relay_key_id
-
-    token = security.create_relay_token(
-        private_key=private_key,
-        key_id=key_id,
-        doc_id=share.web_doc_id,
-        mode="read",  # Web viewers only get read access
-        expires_minutes=settings.relay_token_ttl_minutes,
-    )
-
-    return WebRelayTokenResponse(
-        relay_url=str(settings.relay_public_url).rstrip("/"),
-        token=token,
-        doc_id=share.web_doc_id,
-        expires_at=expires_at,
-    )
 
 
 @router.post("/shares/{slug}/files", status_code=status.HTTP_200_OK)
@@ -1231,7 +1155,6 @@ async def upload_mesh_artifact(
 
     share_identifier: folder UUID (private/sync shares) or web_slug (web-published shares only).
     """
-    import hashlib
     import uuid as _uuid_mod
 
     settings = get_settings()
@@ -1262,42 +1185,16 @@ async def upload_mesh_artifact(
             detail="Upload only supported for folder shares",
         )
 
-    # Agent-key auth (B1)
-    raw_key = request.headers.get("X-Agent-Key")
-    if not raw_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="X-Agent-Key header required"
-        )
-
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-    key_stmt = select(models.ShareAgentKey).where(models.ShareAgentKey.key_hash == key_hash)
-    agent_key = db.execute(key_stmt).scalar_one_or_none()
-
-    if agent_key is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
-
-    if agent_key.share_id != share.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Agent key not valid for this share"
-        )
-
-    if agent_key.revoked_at is not None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Agent key has been revoked"
-        )
-
-    if agent_key.expires_at is not None:
-        from datetime import timezone as _tz
-
-        expires_at = agent_key.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=_tz.utc)
-        if expires_at < security.utcnow():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="Agent key has expired"
-            )
-
-    if "write" not in set(agent_key.scopes.split(",")):
+    # Agent-key auth (B1). Identity/standing via the shared resolver (same cycle
+    # every X-Agent-Key call site needs); scope via the shared literal policy
+    # (ADR-0001) — this route previously carried its own inline copy of both,
+    # which is how a fourth, undetected scope-check divergence became possible
+    # after #b69d73fb consolidated the other three (task #3870a0f1). Deliberately
+    # NOT routed through the full `_auth_agent_key()` wrapper: that also enforces
+    # `agent_key_creator_authorized`, a check this route has never applied, and
+    # this is a scope-consolidation refactor, not a change to who can upload.
+    agent_key = _resolve_share_agent_key(share, request, db)
+    if not agent_key_scopes.satisfies(agent_key_scopes.parse_scopes(agent_key.scopes), "write"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Agent key does not have write scope"
         )
@@ -1444,16 +1341,19 @@ def _resolve_share_for_agent(share_identifier: str, db: Session) -> models.Share
     return share
 
 
-def _auth_agent_key(
-    share: models.Share, request: Request, db: Session, required_scope: str | None = None
+def _resolve_share_agent_key(
+    share: models.Share, request: Request, db: Session
 ) -> models.ShareAgentKey:
-    """Validate X-Agent-Key header against the given share.
+    """Look up and validate the X-Agent-Key header against the given share.
 
-    Returns the ShareAgentKey row on success; raises HTTPException on failure.
-    If required_scope is given, the key must have that scope (e.g. "read" or "write").
+    Covers only identity/standing (hash lookup, share match, revoked, expired) —
+    NOT scope. Every X-Agent-Key call site needs this same cycle; previously
+    ``upload_mesh_artifact`` carried its own copy (task #3870a0f1), which is how
+    a fourth, undetected scope-check divergence became possible after #b69d73fb
+    consolidated the other three. Scope policy stays out of this helper on
+    purpose — callers apply ``agent_key_scopes`` themselves, since what "the
+    right scope" means differs per route (see ADR-0001).
     """
-    import hashlib
-
     raw_key = request.headers.get("X-Agent-Key")
     if not raw_key:
         raise HTTPException(
@@ -1476,8 +1376,6 @@ def _auth_agent_key(
             status_code=status.HTTP_403_FORBIDDEN, detail="Agent key has been revoked"
         )
     if agent_key.expires_at is not None:
-        from datetime import timezone as _tz
-
         exp = agent_key.expires_at
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=_tz.utc)
@@ -1485,7 +1383,24 @@ def _auth_agent_key(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Agent key has expired"
             )
-    if required_scope and required_scope not in set(agent_key.scopes.split(",")):
+    return agent_key
+
+
+def _auth_agent_key(
+    share: models.Share, request: Request, db: Session, required_scope: str | None = None
+) -> models.ShareAgentKey:
+    """Validate X-Agent-Key header against the given share.
+
+    Returns the ShareAgentKey row on success; raises HTTPException on failure.
+    If required_scope is given, the key must have that scope (e.g. "read" or "write").
+    """
+    agent_key = _resolve_share_agent_key(share, request, db)
+    # Third helper, same policy object (ADR-0001). Only ever called with
+    # required_scope="write" today; routed through the shared check so a future
+    # read-requiring caller cannot silently reintroduce a fourth answer.
+    if required_scope and not agent_key_scopes.satisfies(
+        agent_key_scopes.parse_scopes(agent_key.scopes), required_scope
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Agent key does not have {required_scope} scope",
@@ -1535,7 +1450,19 @@ def _auth_share_read_access(share: models.Share, request: Request, db: Session) 
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="Agent key has expired"
                 )
-        if "read" not in set(agent_key.scopes.split(",")):
+        # Same policy object as _require_private_web_auth — see ADR-0001. These
+        # two helpers used to disagree about whether a write-only key may read,
+        # on route families that return identical bytes (#b69d73fb).
+        #
+        # Deliberately NO grace here. Grace exists to keep the LENIENT routes
+        # behaving exactly as they did while their population is measured; it is
+        # not a licence to widen this one. These routes are UUID-addressable and
+        # therefore reach shares that were never web-published — where a
+        # write-only key can read nothing today. Extending grace here would hand
+        # five external customers' write-only keys read access to unpublished
+        # private vault content, which is the regression this whole change exists
+        # to avoid. Convergence happens by the lenient side tightening.
+        if not agent_key_scopes.satisfies(agent_key_scopes.parse_scopes(agent_key.scopes), "read"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Agent key does not have read scope",
@@ -1583,8 +1510,7 @@ def _auth_share_read_access(share: models.Share, request: Request, db: Session) 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=(
-            "Authentication required: provide X-Agent-Key header "
-            "or Authorization: Bearer <token>"
+            "Authentication required: provide X-Agent-Key header or Authorization: Bearer <token>"
         ),
         headers={"WWW-Authenticate": "Bearer"},
     )

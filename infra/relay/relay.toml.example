@@ -1,6 +1,11 @@
 [server]
-# Public URL used by clients; DOMAIN_BASE is interpolated during deploy
-url = "https://relay.example.com"
+# MUST equal RELAY_AUDIENCE in .env exactly (control-plane's aud claim is checked
+# against this string byte-for-byte). DOMAIN_BASE is your base domain, e.g.
+# example.com — installation.md step 4: there is no separate relay. subdomain,
+# so this is https://{DOMAIN_BASE}, NOT https://relay.{DOMAIN_BASE}. If you
+# leave RELAY_AUDIENCE unset, the control-plane derives the same value from
+# RELAY_PUBLIC_URL's host — see docs/configuration.md.
+url = "https://example.com"
 host = "0.0.0.0"
 port = 8080
 
@@ -13,8 +18,9 @@ format = "pretty"
 
 # Auth keys from control plane
 # Get these values from: curl https://cp.YOUR_DOMAIN/keys/public
-# If RELAY_PRIVATE_KEY is set in .env, the control plane uses a stable keypair.
-# Otherwise, it auto-generates one on each startup (check control-plane logs).
+# RELAY_PRIVATE_KEY must be set in .env before the control plane will start — it is
+# required, and no keypair is generated for you. The public half below is derived from
+# it, so it only changes when you change the private key.
 [[auth]]
 key_id = "REPLACE_WITH_KEY_ID"
 public_key = "REPLACE_WITH_PUBLIC_KEY_BASE64"

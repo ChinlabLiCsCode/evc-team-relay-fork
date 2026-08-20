@@ -157,14 +157,51 @@ class TestRelayTokenHappyPath:
         data = resp.json()
         claims = decode_cwt_claims(data["token"])
 
-        assert claims["iss"] == "relay-control-plane"
+        # #f975dd60: our evc-relay-server fork requires iss in its VALID_ISSUERS
+        # allowlist and requires aud — "relay-control-plane" + no-aud (the old
+        # expectations here) is exactly the pair of defects that left collab
+        # broken in prod for 6 months. See Settings.relay_token_issuer /
+        # effective_relay_audience.
+        assert claims["iss"] == "relay-server"
         assert claims["scope"] == f"doc:{share_id}:rw"
         assert "iat" in claims
         # H6: exp is now required for TTL enforcement
         assert "exp" in claims, "exp missing — H6 security regression"
         assert claims["exp"] > claims["iat"]
-        # aud must NOT appear — y-sweet rejects it
-        assert "aud" not in claims
+        # aud MUST appear — relay-server rejects tokens missing it. Derived from
+        # RELAY_PUBLIC_URL=wss://relay.test (conftest.py) -> https://relay.test.
+        assert (
+            claims.get("aud") == "https://relay.test"
+        ), "aud missing or wrong — relay-server requires it (#f975dd60)"
+
+    def test_issuance_increments_relay_tokens_issued_metric(self, client: TestClient):
+        """relay_tokens_issued_total must actually increment on issuance (#188f683c).
+
+        The metric was declared in metrics.py but never incremented anywhere —
+        the "Relay Tokens Issued (hourly)" Grafana panel could never show data.
+        """
+        import re
+
+        def _read_metric(mode: str) -> float:
+            body = client.get("/metrics").text
+            m = re.search(
+                rf'^relay_tokens_issued_total\{{mode="{mode}"\}} ([\d.]+)$', body, re.MULTILINE
+            )
+            return float(m.group(1)) if m else 0.0
+
+        admin_token = login(client, "bootstrap@example.com", "super-secret")
+        share_id = create_share(client, admin_token)
+        before = _read_metric("write")
+
+        resp = client.post(
+            "/tokens/relay",
+            json={"share_id": share_id, "doc_id": share_id, "mode": "write"},
+            headers=auth_headers(admin_token),
+        )
+        assert resp.status_code == 200
+
+        after = _read_metric("write")
+        assert after == before + 1, f"expected +1 write token issued, got {before} -> {after}"
 
     def test_read_mode_scope(self, client: TestClient):
         admin_token = login(client, "bootstrap@example.com", "super-secret")

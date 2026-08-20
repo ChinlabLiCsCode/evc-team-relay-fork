@@ -48,9 +48,18 @@ DOMAIN_BASE=yourdomain.com
 ACME_EMAIL=admin@yourdomain.com
 JWT_SECRET=$(openssl rand -hex 32)
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
+# DATABASE_URL is a separate literal value — if you randomize POSTGRES_PASSWORD,
+# also update the password embedded in DATABASE_URL to match, or the app
+# will fail to connect (postgres and control-plane will disagree on it).
 MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
 BOOTSTRAP_ADMIN_EMAIL=admin@yourdomain.com
 BOOTSTRAP_ADMIN_PASSWORD=your-secure-password
+
+# REQUIRED — Ed25519 keypair for relay auth. Generate the private half:
+openssl genpkey -algorithm ed25519 -out relay_private.pem
+# RELAY_PRIVATE_KEY= the base64 output of:
+openssl base64 -A -in relay_private.pem
+# You'll need the matching public key in step 3 below.
 ```
 
 See [Configuration Reference](configuration.md) for all options.
@@ -61,35 +70,94 @@ See [Configuration Reference](configuration.md) for all options.
 cp relay/relay.toml.example relay/relay.toml
 ```
 
-Edit `relay/relay.toml` to match your MinIO credentials from `.env`.
+Edit `relay/relay.toml`:
+- `[server].url` — **must equal `RELAY_AUDIENCE` in `.env` exactly** (or, if you left
+  `RELAY_AUDIENCE` unset, must equal `https://${DOMAIN_BASE}` — the default control-plane
+  derives from `RELAY_PUBLIC_URL`'s host). A mismatch here fails silently: tokens are issued
+  and signed correctly but every WebSocket connection is rejected with no useful log line.
+  Remember there is no separate `relay.` subdomain (step 4 below) — this is
+  `https://yourdomain.com`, not `https://relay.yourdomain.com`.
+- `[store]` — MinIO credentials from `.env` (`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`).
+- `[[auth]]` — `key_id` matches `RELAY_KEY_ID` in `.env` if you set one (defaults to `relay_cp_dev`
+  if omitted); `public_key` is the Ed25519 public key derived from the private key you generated
+  in step 2:
+  ```bash
+  python3 -c "
+  from cryptography.hazmat.primitives import serialization
+  import base64
+  with open('relay_private.pem', 'rb') as f:
+      priv = serialization.load_pem_private_key(f.read(), password=None)
+  pub = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+  print(base64.b64encode(pub).decode())
+  "
+  ```
 
 ### 4. Configure DNS
 
+`DOMAIN_BASE` itself is the relay server's domain — there is no separate `relay.` subdomain.
 Point these DNS records to your server IP:
 
 | Record | Type | Value |
 |--------|------|-------|
+| `yourdomain.com` (i.e. your `DOMAIN_BASE`) | A | Your server IP |
 | `cp.yourdomain.com` | A | Your server IP |
-| `relay.yourdomain.com` | A | Your server IP |
 | `docs.yourdomain.com` | A | Your server IP (optional, for web publishing) |
 
 ### 5. Review Caddy Configuration
 
-The default `Caddyfile` handles TLS termination, routing, and **WebSocket token proxying**. The relay server expects authentication via the `Authorization` header, but browser WebSocket API cannot set custom headers. Caddy bridges this gap by extracting `?token=` from the query string and setting it as an `Authorization: Bearer` header:
+The default `Caddyfile` handles TLS termination and routing. For plain HTTP endpoints it also
+does **WebSocket token proxying**: since the browser WebSocket API cannot set custom headers,
+Caddy extracts `?token=` from the query string and sets it as an `Authorization: Bearer` header
+— but the relay server's WebSocket-upgrade handlers only ever read the token from the query
+string, never from a header, so that rewrite must skip the WS paths or it strips the one thing
+the handler checks:
 
 ```caddy
-relay.{$DOMAIN_BASE} {
-  @token_in_query query token=*
-  request_header @token_in_query Authorization "Bearer {query.token}"
-  reverse_proxy relay-server:8080
+{$DOMAIN_BASE} {
+  @token_in_query {
+    query token=*
+    not path /doc/ws/* /d/*/ws/*
+  }
+  handle @token_in_query {
+    route {
+      request_header Authorization "Bearer {query.token}"
+      uri query -token
+      reverse_proxy relay-server:8080
+    }
+  }
+  handle {
+    reverse_proxy relay-server:8080
+  }
 }
 ```
 
-This allows the Obsidian plugin (and other browser-based clients) to authenticate using `wss://relay.yourdomain.com/doc/ws/{docId}?token=CWT_TOKEN`.
+This allows the Obsidian plugin (and other browser-based clients) to authenticate using `wss://yourdomain.com/doc/ws/{docId}?token=CWT_TOKEN` — the WS upgrade carries the token straight through to relay-server's own query-param verifier, unmodified.
 
-> **Important**: Do not remove the `request_header` directive — without it, the Obsidian plugin will receive `401 Unauthorized` when connecting to the relay server.
+> **Important**: Do not add the `Authorization` rewrite back to the `/doc/ws/*` and `/d/*/ws/*` paths — it was there originally and caused every WebSocket connection to fail auth with `missing_token` (see [#137](https://github.com/entire-vc/evc-team-relay/pull/137) for the incident this config now avoids).
 
-### 6. Start Services
+### 6. Pull the Published Images
+
+`web-publish` builds from source only with a GitHub token scoped to our private
+`@entire-vc/*` packages — not available outside the org. Pull the images the release
+workflow already publishes publicly instead (run from the repo root, one level up from
+`infra/`):
+
+```bash
+bash scripts/pull-published-images.sh
+```
+
+This tags them locally as `infra-control-plane:latest` / `infra-web-publish:latest`, which
+`docker compose up` picks up without attempting to build. Pass a version to pin one
+(`bash scripts/pull-published-images.sh 1.10.0`) instead of the default `latest`.
+
+> linux/amd64 only for now — there is no arm64 manifest yet, so this fails on Apple Silicon
+> or other arm64 hosts without emulation (e.g. `export DOCKER_DEFAULT_PLATFORM=linux/amd64`
+> under Docker Desktop).
+
+If you do have org access and want to build from source instead (e.g. active development),
+skip this step and run `docker compose up -d --build` in step 7.
+
+### 7. Start Services
 
 ```bash
 docker compose up -d
@@ -101,7 +169,7 @@ Wait for all services to become healthy:
 docker compose ps
 ```
 
-### 7. Verify Installation
+### 8. Verify Installation
 
 ```bash
 # Check health
@@ -113,7 +181,7 @@ curl https://cp.yourdomain.com/version
 # Expected: {"version":"1.x.x"}
 ```
 
-### 8. Access Admin Panel
+### 9. Access Admin Panel
 
 Open `https://cp.yourdomain.com/admin-ui/` in your browser and login with your bootstrap admin credentials.
 
@@ -138,14 +206,10 @@ Open `https://cp.yourdomain.com/admin-ui/` in your browser and login with your b
 
 ### Using Pre-built Images
 
-For production, you can use pre-built images from GitHub Container Registry:
-
-```yaml
-services:
-  control-plane:
-    image: ghcr.io/entire-vc/evc-team-relay/control-plane:latest
-    # ... rest of config
-```
+This is the default path (step 6 above) — `bash scripts/pull-published-images.sh [version]`
+pulls both `control-plane` and `web-publish` from GitHub Container Registry and tags them
+locally so `docker compose up -d` uses them without building. Re-run it with a new version
+to update.
 
 ### Systemd Service (Optional)
 
@@ -192,8 +256,13 @@ docker compose up -d --build
 
 ### With Pre-built Images
 
+`docker compose pull` won't work here — `control-plane`/`web-publish` are tagged locally
+(`infra-control-plane:latest`/`infra-web-publish:latest`, not a registry reference), by design
+so the same compose file works whether you build from source or pull. Re-run the pull script
+instead:
+
 ```bash
-docker compose pull
+bash scripts/pull-published-images.sh [version]
 docker compose up -d
 ```
 
