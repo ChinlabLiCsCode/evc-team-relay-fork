@@ -1,0 +1,5 @@
+# Shell scripts run as container entrypoints/commands on Linux — a mangled shebang
+# (e.g. CRLF from a Windows checkout with core.autocrlf=true, turning "#!/bin/bash"
+# into "#!/bin/bash\r") breaks them with a confusing "exec: no such file or directory"
+# error. Force LF regardless of platform or local autocrlf setting.
+*.sh text eol=lf
