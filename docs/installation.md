@@ -17,6 +17,17 @@ This guide covers installing EVC Team Relay on a Linux server using Docker Compo
 - Domain name with DNS access
 - (Optional) SSL certificates or use Caddy's automatic HTTPS
 
+### Architecture
+
+**`control-plane`, `web-publish`, and `relay-server` all publish native
+`linux/amd64` and `linux/arm64` images** — no setup needed on Apple
+Silicon, AWS Graviton, Ampere at Hetzner/OVH, or Raspberry Pi; Docker
+pulls the manifest matching your host automatically, and
+`scripts/pull-published-images.sh` (step 6 below) picks the right one on
+its own for the two images it handles. `relay-server` is pulled later, by
+`docker compose up` itself in step 7 — same automatic manifest match,
+no platform pin, nothing to export.
+
 ### Ports
 
 | Port | Service | Required |
@@ -150,9 +161,10 @@ This tags them locally as `infra-control-plane:latest` / `infra-web-publish:late
 `docker compose up` picks up without attempting to build. Pass a version to pin one
 (`bash scripts/pull-published-images.sh 1.10.0`) instead of the default `latest`.
 
-> linux/amd64 only for now — there is no arm64 manifest yet, so this fails on Apple Silicon
-> or other arm64 hosts without emulation (e.g. `export DOCKER_DEFAULT_PLATFORM=linux/amd64`
-> under Docker Desktop).
+> **arm64 hosts:** nothing to do here — the script pulls the native `linux/arm64` build
+> of both images automatically. `relay-server` in step 7 is native `linux/arm64` too,
+> pulled directly by `docker compose up` with no platform pin; see
+> [Architecture](#architecture) above.
 
 If you do have org access and want to build from source instead (e.g. active development),
 skip this step and run `docker compose up -d --build` in step 7.

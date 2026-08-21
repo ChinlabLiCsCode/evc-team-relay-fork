@@ -52,6 +52,11 @@ You want your team in Obsidian, editing together, publishing docs — without gi
 Full walkthrough — DNS, production hardening, systemd, troubleshooting — lives in the
 **[Installation Guide](docs/installation.md)**. The short version:
 
+> **arm64 hosts** (Apple Silicon, Graviton, Ampere, Raspberry Pi): `control-plane`,
+> `web-publish`, and `relay-server` all publish native `linux/arm64` images — nothing to
+> export, nothing to pin. See
+> [Installation → Architecture](docs/installation.md#architecture) for details.
+
 ```bash
 git clone https://github.com/entire-vc/evc-team-relay.git
 cd evc-team-relay/infra

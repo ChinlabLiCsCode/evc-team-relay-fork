@@ -90,6 +90,7 @@ def create_file_token(
     content_type: str,
     content_length: int,
     expires_minutes: int = 10,
+    agent_write: bool | None = None,
 ) -> str:
     """Mint a short-lived, path-scoped token for attachment (CAS) access.
 
@@ -97,6 +98,15 @@ def create_file_token(
     never be usable as a general session credential (see the "scope" check
     in deps._get_user_from_token) — it grants access to exactly one file's
     HEAD/download-url/upload-url for a few minutes, nothing else.
+
+    agent_write: None when minted for a real user session (upload-url then
+    re-checks that user's actual membership role via ensure_write_access,
+    which already denies a viewer correctly — no gap there). When minted for
+    an agent key, the caller MUST pass True/False for whether that key holds
+    literal write scope: the token's subject becomes the share owner (an
+    agent key has no models.User of its own), and the owner always clears
+    ensure_write_access, so without this claim a read-only key's token would
+    silently carry write capability at upload-url. See #d4c851af.
     """
     settings = get_settings()
     expire_delta = timedelta(minutes=expires_minutes)
@@ -108,6 +118,7 @@ def create_file_token(
         "sha256": sha256,
         "content_type": content_type,
         "content_length": content_length,
+        "agent_write": agent_write,
         "exp": utcnow() + expire_delta,
         "iat": utcnow(),
     }
@@ -204,13 +215,6 @@ def create_relay_token_cwt(
     mode: str,
     expires_minutes: int,
     audience: str | None = None,
-    # relay-server hardcodes an issuer allowlist (crates/y-sweet-core/src/auth.rs
-    # VALID_ISSUERS: "relay-server", "auth.system3.dev", "auth.system3.md") that was
-    # never updated for a self-hosted control-plane's own issuer identity — any other
-    # value, including the "relay-control-plane" this used to default to, is rejected
-    # with AuthError::InvalidClaims regardless of signature/audience validity. Since
-    # relay-server is a closed-source image we can't patch, use the accepted value
-    # closest to our own identity. Confirmed 2026-08-17.
     issuer: str = "relay-server",
     share_id: str | None = None,
 ) -> str:
@@ -263,9 +267,13 @@ def create_relay_token_cwt(
             tokens with no aud claim (MissingAudience) once it knows to expect one.
         issuer: Token issuer. Must be one of relay-server's VALID_ISSUERS allowlist
             ("relay-server", "auth.system3.dev", "auth.system3.md" as of image 0.9.9) —
-            see Settings.relay_token_issuer. Default kept at "relay-control-plane" for
-            call-site backward-compat, but callers going through token_service.py
-            override this via settings.relay_token_issuer.
+            see Settings.relay_token_issuer. Default is "relay-server", matching
+            Settings.relay_token_issuer's own default (#7908e17e — the previous
+            default here, "relay-control-plane", is NOT in the allowlist and was
+            enshrined as "correct" by two tests that have since been rewritten to
+            assert allowlist membership instead; callers going through
+            token_service.py still override this explicitly via
+            settings.relay_token_issuer).
         share_id: Share UUID the token was issued against (added as CWT_CLAIM_SHARE)
 
     Returns:

@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api import deps
-from app.core import security
+from app.core import agent_key_scopes, security
 from app.core.config import get_settings
 from app.db import models
 from app.db.session import get_db
@@ -129,14 +129,20 @@ def _get_minio_client() -> Minio:
 
 
 def _get_minio_public_client() -> Minio:
-    """MinIO client used ONLY to generate presigned URLs for external clients
-    (e.g. the Obsidian plugin's upload/download). minio_endpoint is typically a
-    Docker-internal hostname (e.g. "minio:9000") that only control-plane can
-    resolve — a presigned URL built against it is dead on arrival for anything
-    outside the Docker network. This client points at minio_public_endpoint
-    instead (falls back to minio_endpoint if unset, e.g. for non-containerized
-    deployments where they're the same). Never used for direct calls
-    (stat_object, bucket creation, etc.) — those still go through
+    """MinIO client used ONLY to generate presigned PUT URLs for uploads
+    (get_file_upload_url below). minio_endpoint is typically a Docker-internal
+    hostname (e.g. "minio:9000") that only control-plane can resolve — a
+    presigned URL built against it is dead on arrival for anything outside the
+    Docker network. This client points at minio_public_endpoint instead (falls
+    back to minio_endpoint if unset, e.g. for non-containerized deployments
+    where they're the same).
+
+    Downloads no longer use this (see get_file_download_url / get_file_content
+    below — upstream #224 moved downloads to control-plane proxying the bytes
+    itself, which needs no public MinIO endpoint at all). Uploads still PUT
+    directly to a presigned MinIO URL, so this is still needed for that path
+    specifically, and for nothing else — never used for direct calls
+    (stat_object, bucket creation, etc.), those still go through
     _get_minio_client()."""
     settings = get_settings()
     return Minio(
@@ -186,10 +192,16 @@ def _authorize_share_sync(
     current_user: models.User | None,
     *,
     required_scope: str,
-) -> str:
+) -> tuple[str, models.ShareAgentKey | None]:
     """Authorize a sync-protocol request via X-Agent-Key or user JWT.
 
-    Returns "agent_key" or "user". The agent-key branch also checks the key's
+    Returns (method, agent_key): method is "agent_key" or "user"; agent_key is
+    the authenticated row when method == "agent_key", else None. Exposing the
+    row (not just the fact that `required_scope` was satisfied) lets a caller
+    that needs to know MORE than the one scope it required — e.g. file-token
+    minting, which only requires `read` to mint but must remember whether that
+    same key also holds `write` — inspect `agent_key.scopes` without a second
+    authentication round trip. The agent-key branch also checks the key's
     standing (creator still owner/member/admin) and the literal scope, and
     stamps last_used_at — committed here, because the read routes commit
     nothing of their own and an uncommitted stamp would be silently discarded.
@@ -205,7 +217,7 @@ def _authorize_share_sync(
             db.commit()
         except Exception:  # pragma: no cover - telemetry must not 500
             db.rollback()
-        return "agent_key"
+        return "agent_key", agent_key
 
     if current_user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing credentials")
@@ -214,7 +226,7 @@ def _authorize_share_sync(
         share_service.ensure_write_access(db, share, current_user)
     else:
         share_service.ensure_read_access(db, share, current_user)
-    return "user"
+    return "user", None
 
 
 @router.get("/{share_id}/files-index", response_model=list[SyncArtifactItem])
@@ -257,7 +269,7 @@ def get_share_files_index(
 
 
 def _sync_read_headers(item: dict[str, Any]) -> dict[str, str]:
-    """ETag/Last-Modified for a sync-protocol read.
+    """ETag/X-Updated-At for a sync-protocol read.
 
     The ETag is the item's stored sha256 — the exact token PUT /sync-write
     expects back in If-Match, so a caller can do read → edit → conditional
@@ -465,7 +477,9 @@ async def sync_write_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="sync-write only supported for folder shares",
         )
-    auth_method = _authorize_share_sync(request, share, db, current_user, required_scope="write")
+    auth_method, _agent_key = _authorize_share_sync(
+        request, share, db, current_user, required_scope="write"
+    )
 
     path = _validate_file_path(path)
 
@@ -580,7 +594,7 @@ async def sync_write_file(
 # ensure_read_access/ensure_write_access, rather than trusting a mode baked
 # into the token. Least-privilege, short expiry (10 min), single path scope.
 
-_ALLOWED_FILE_PATH_RE = re.compile(r"^[a-zA-Z0-9._\-/А-Яа-я ]+$")
+_ALLOWED_FILE_PATH_RE = re.compile(r"^[\w.\-/ ]+$", re.UNICODE)
 FILE_TOKEN_EXPIRE_MINUTES = 10
 
 
@@ -634,20 +648,15 @@ def _validate_file_path(path: str) -> str:
     return path
 
 
-def _decode_file_token(share_id: uuid.UUID, path: str, authorization: str | None) -> dict[str, Any]:
-    """Decode+validate the Bearer file-token on HEAD/download-url/upload-url.
+def _decode_file_token_value(token: str, share_id: uuid.UUID, path: str) -> dict[str, Any]:
+    """Shared core: decode+validate a raw file-token string against share_id/path.
 
-    Deliberately NOT deps.get_current_user — that accepts normal session
-    JWTs, and (per its own guard) now explicitly REJECTS scope=file tokens.
-    This is the file-token-only counterpart.
+    Used by both the Authorization-header form below (HEAD/download-url mint,
+    upload-url) and the query-string form consumed by GET .../content — the
+    actual byte-serving route a client hits with a bare GET and so cannot
+    attach a header to (see that route's docstring for why the credential
+    rides in the URL there).
     """
-    if not authorization:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing credentials")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Authorization header"
-        )
     try:
         payload = security.decode_access_token(token)
     except InvalidTokenError as exc:
@@ -665,6 +674,23 @@ def _decode_file_token(share_id: uuid.UUID, path: str, authorization: str | None
             status_code=status.HTTP_403_FORBIDDEN, detail="Token not valid for this path"
         )
     return payload
+
+
+def _decode_file_token(share_id: uuid.UUID, path: str, authorization: str | None) -> dict[str, Any]:
+    """Decode+validate the Bearer file-token on HEAD/download-url/upload-url.
+
+    Deliberately NOT deps.get_current_user — that accepts normal session
+    JWTs, and (per its own guard) now explicitly REJECTS scope=file tokens.
+    This is the file-token-only counterpart.
+    """
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing credentials")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Authorization header"
+        )
+    return _decode_file_token_value(token, share_id, path)
 
 
 def _user_from_file_token(db: Session, payload: dict[str, Any]) -> models.User:
@@ -685,29 +711,54 @@ def _user_from_file_token(db: Session, payload: dict[str, Any]) -> models.User:
 
 @router.post("/{share_id}/file-token", response_model=FileTokenResponse)
 def create_file_token(
+    request: Request,
     share_id: uuid.UUID,
     payload: FileTokenRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(deps.get_current_user),
+    current_user: models.User | None = Depends(deps.get_optional_user),
 ) -> FileTokenResponse:
     """Mint a short-lived, path-scoped token for attachment (CAS) access.
 
     Minimum bar to mint at all is read access — write is re-checked
     independently at upload-url, so a viewer can verify/download but a
     write-url request 403s unless they actually have write access.
+
+    Auth: Authorization: Bearer <user JWT>, or X-Agent-Key with `read` scope
+    — symmetric to files-index/download/sync-write (#ee1745ce). An agent key
+    has no `models.User` of its own, so the minted token's subject is the
+    share owner: HEAD/download-url/upload-url decode the token and re-check
+    `ensure_read_access`/`ensure_write_access` against that subject. For a
+    user-minted token that's the whole story — the owner always clears both,
+    but so does re-deriving the real caller's own membership role, since the
+    subject IS that real user. For an agent-key-minted token the subject is
+    a stand-in (the owner), which would silently launder a read-only key's
+    token into write access at upload-url — so the token also carries the
+    minting key's own `write` scope as an explicit claim (`agent_write`),
+    which upload-url checks BEFORE trusting the owner-subject's access.
     """
     share = share_service.get_share(db, share_id)
-    share_service.ensure_read_access(db, share, current_user)
+    auth_method, agent_key = _authorize_share_sync(
+        request, share, db, current_user, required_scope="read"
+    )
     path = _validate_file_path(payload.path)
 
+    if auth_method == "user":
+        subject = str(current_user.id)
+        agent_write: bool | None = None
+    else:
+        subject = str(share.owner_user_id)
+        key_scopes = agent_key_scopes.parse_scopes(agent_key.scopes)
+        agent_write = agent_key_scopes.satisfies(key_scopes, "write")
+
     token = security.create_file_token(
-        subject=str(current_user.id),
+        subject=subject,
         share_id=str(share_id),
         path=path,
         sha256=payload.sha256,
         content_type=payload.content_type,
         content_length=payload.content_length,
         expires_minutes=FILE_TOKEN_EXPIRE_MINUTES,
+        agent_write=agent_write,
     )
     expires_at = (security.utcnow() + timedelta(minutes=FILE_TOKEN_EXPIRE_MINUTES)).isoformat()
     settings = get_settings()
@@ -752,7 +803,22 @@ def get_file_download_url(
     db: Session = Depends(get_db),
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> DownloadUrlResponse:
-    """CAS.ts readFile() step 1: mint a presigned MinIO GET for this attachment."""
+    """CAS.ts readFile() step 1: mint a control-plane URL for this attachment.
+
+    Used to mint a presigned MinIO GET directly (effef307) — unusable outside
+    the relay's own compose network, since MinIO has no public endpoint
+    (internal DNS name `minio`, no published port or vhost) and publishing
+    one would force every self-hoster to expose their object store. Now
+    returns a control-plane URL (GET .../content, below) that streams the
+    bytes itself, matching web.py's serve_web_asset precedent.
+
+    The returned URL carries the SAME file-token as its `token` query
+    credential rather than minting a second one: the token already proves
+    read access to exactly this share_id+path and is already short-lived
+    (10 min), so reusing it is not weaker than a fresh signature — and it's
+    the same shape a MinIO presigned URL already had (credential in the
+    query, no header on the final bare GET), not a new exposure class.
+    """
     token_payload = _decode_file_token(share_id, path, authorization)
     user = _user_from_file_token(db, token_payload)
     share = share_service.get_share(db, share_id)
@@ -762,12 +828,9 @@ def get_file_download_url(
     object_name = f"web-assets/{share_id}/{path}"
     minio_client = _get_minio_client()
     try:
-        # Confirm the object exists before minting the URL — a presigned GET
-        # for a missing key 404s opaquely from MinIO, not from this API.
+        # Confirm the object exists before minting the URL — GET .../content
+        # 404ing from OUR api is easier to diagnose than an opaque MinIO 403.
         minio_client.stat_object(settings.minio_bucket, object_name)
-        url = _get_minio_public_client().presigned_get_object(
-            settings.minio_bucket, object_name, expires=timedelta(minutes=10)
-        )
     except S3Error as e:
         if e.code in ("NoSuchKey", "NoSuchObject"):
             raise HTTPException(
@@ -777,7 +840,65 @@ def get_file_download_url(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve file: {e}",
         ) from e
-    return DownloadUrlResponse(downloadUrl=url)
+
+    # authorization is guaranteed "Bearer <token>" here — _decode_file_token
+    # already rejected anything else above.
+    _, _, raw_token = authorization.partition(" ")
+    base = settings.control_plane_public_url.rstrip("/")
+    download_url = (
+        f"{base}/shares/{share_id}/files/{quote(path, safe='/')}/content"
+        f"?token={quote(raw_token, safe='')}"
+    )
+    return DownloadUrlResponse(downloadUrl=download_url)
+
+
+@router.get("/{share_id}/files/{path:path}/content")
+def get_file_content(
+    share_id: uuid.UUID,
+    path: str,
+    token: str = Query(..., description="File-token from download-url's downloadUrl"),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve attachment bytes directly (CAS.ts readFile() step 2).
+
+    Mirrors web.py's serve_web_asset: reads the object from MinIO server-side
+    and streams the bytes back, instead of redirecting the client to MinIO
+    directly — MinIO is not publicly reachable (effef307). Auth is a query
+    param, not a header, because this is the URL the client fetches with a
+    bare GET; see get_file_download_url's docstring for why that's not a new
+    exposure class versus the presigned-MinIO-URL shape it replaces.
+    """
+    token_payload = _decode_file_token_value(token, share_id, path)
+    user = _user_from_file_token(db, token_payload)
+    share = share_service.get_share(db, share_id)
+    share_service.ensure_read_access(db, share, user)
+
+    settings = get_settings()
+    object_name = f"web-assets/{share_id}/{path}"
+    minio_client = _get_minio_client()
+    try:
+        minio_resp = minio_client.get_object(settings.minio_bucket, object_name)
+        try:
+            data = minio_resp.read()
+            content_type = minio_resp.headers.get("Content-Type", "application/octet-stream")
+        finally:
+            minio_resp.close()
+            minio_resp.release_conn()
+    except S3Error as e:
+        if e.code in ("NoSuchKey", "NoSuchObject"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve file: {e}",
+        ) from e
+
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.post("/{share_id}/files/{path:path}/upload-url", response_model=UploadUrlResponse)
@@ -796,6 +917,17 @@ def get_file_upload_url(
     here the storage write happens client-side a moment later instead).
     """
     token_payload = _decode_file_token(share_id, path, authorization)
+    # An agent-key-minted token's subject is the share owner (a stand-in — the
+    # key has no models.User of its own), who always clears ensure_write_access
+    # below regardless of the key's own scope. `agent_write` is the minting
+    # key's actual scope, explicit and False rather than absent so a read-only
+    # key can never fall through: absent (None) means a real user minted this,
+    # where ensure_write_access already checks their genuine membership role.
+    if token_payload.get("agent_write") is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent key does not have write scope",
+        )
     user = _user_from_file_token(db, token_payload)
     share = share_service.get_share(db, share_id)
     share_service.ensure_write_access(db, share, user)

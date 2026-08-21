@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 
 import pytest
@@ -1112,6 +1113,109 @@ class TestShareWebDocIdField:
         assert update_response.status_code == 200
         assert update_response.json()["web_doc_id"] == test_doc_id
 
+    def test_repeat_publish_toggle_with_same_web_doc_id_does_not_change_it(
+        self, client: TestClient, test_user: models.User
+    ):
+        """#54b07714 AC#1: toggling publish twice in a row (plugin resends the
+        same web_doc_id on every toggle) leaves the stored value unchanged."""
+        login_response = client.post(
+            "/auth/login", json={"email": test_user.email, "password": "test123456"}
+        )
+        token = login_response.json()["access_token"]
+
+        create_response = client.post(
+            "/v1/shares",
+            json={
+                "kind": "doc",
+                "path": "DocId Repeat Toggle Test.md",
+                "visibility": "private",
+                "web_published": True,
+            },
+            headers=_auth_headers(token),
+        )
+        assert create_response.status_code == 201
+        share_id = create_response.json()["id"]
+
+        test_doc_id = "s3rn:relay:relay:repeat:folder:def:doc:ghi"
+
+        # First toggle: no existing value → sets it (AC#2, reverse direction).
+        first = client.patch(
+            f"/v1/shares/{share_id}",
+            json={"web_doc_id": test_doc_id},
+            headers=_auth_headers(token),
+        )
+        assert first.status_code == 200
+        assert first.json()["web_doc_id"] == test_doc_id
+
+        # Second toggle: plugin resends the identical value → must stay the same.
+        second = client.patch(
+            f"/v1/shares/{share_id}",
+            json={"web_doc_id": test_doc_id},
+            headers=_auth_headers(token),
+        )
+        assert second.status_code == 200
+        assert second.json()["web_doc_id"] == test_doc_id
+
+    def test_differing_web_doc_id_on_already_set_share_is_ignored_and_logged(
+        self, client: TestClient, test_user: models.User, caplog: pytest.LogCaptureFixture
+    ):
+        """#54b07714 AC#3: once web_doc_id is set, a DIFFERENT incoming value
+        (e.g. plugin re-encodes the id across a version bump) must not silently
+        repoint the share at another y-sweet document. Behavior is explicit:
+        ignore the new value and log a warning — never overwrite."""
+        login_response = client.post(
+            "/auth/login", json={"email": test_user.email, "password": "test123456"}
+        )
+        token = login_response.json()["access_token"]
+
+        create_response = client.post(
+            "/v1/shares",
+            json={
+                "kind": "doc",
+                "path": "DocId Mismatch Test.md",
+                "visibility": "private",
+                "web_published": True,
+            },
+            headers=_auth_headers(token),
+        )
+        assert create_response.status_code == 201
+        share_id = create_response.json()["id"]
+
+        original_doc_id = "s3rn:relay:relay:original:folder:def:doc:ghi"
+        first = client.patch(
+            f"/v1/shares/{share_id}",
+            json={"web_doc_id": original_doc_id},
+            headers=_auth_headers(token),
+        )
+        assert first.status_code == 200
+        assert first.json()["web_doc_id"] == original_doc_id
+
+        different_doc_id = "s3rn:relay:relay:DIFFERENT:folder:def:doc:ghi"
+        with caplog.at_level(logging.WARNING, logger="app.services.share_service"):
+            second = client.patch(
+                f"/v1/shares/{share_id}",
+                json={"web_doc_id": different_doc_id},
+                headers=_auth_headers(token),
+            )
+        # Request still succeeds (this is a soft ignore, not a client error) —
+        # but the STORED value must be the original, not the differing one.
+        assert second.status_code == 200
+        assert second.json()["web_doc_id"] == original_doc_id
+        assert second.json()["web_doc_id"] != different_doc_id
+
+        rejected_logs = [
+            r for r in caplog.records if getattr(r, "event", "") == "web_doc_id_change_rejected"
+        ]
+        assert len(rejected_logs) == 1
+        assert rejected_logs[0].existing_web_doc_id == original_doc_id
+        assert rejected_logs[0].attempted_web_doc_id == different_doc_id
+
+        # A follow-up GET (fresh read) confirms the DB row itself, not just the
+        # PATCH response, holds the original value.
+        get_response = client.get(f"/v1/shares/{share_id}", headers=_auth_headers(token))
+        assert get_response.status_code == 200
+        assert get_response.json()["web_doc_id"] == original_doc_id
+
 
 class TestWebRelayTokenEndpointRemoved:
     """#edfd1dd3 AC#5: GET /v1/web/shares/{slug}/token no longer exists.
@@ -1224,6 +1328,49 @@ class TestFolderFileContentSync:
         data = response.json()
         assert data["path"] == "doc1.md"
         assert "message" in data
+
+        get_settings.cache_clear()
+
+    def test_sync_folder_file_content_stamps_hash_and_becomes_sync_visible(
+        self, client: TestClient, db_session: Session, folder_share: models.Share, monkeypatch
+    ):
+        """#d4c851af finding 1/2: this is the plugin's actual content-push path
+        (the /shares/{id} PATCH web_folder_items list never carries content).
+        Before the fix the pushed item had content but no sha256/source, so it
+        was invisible to GET /v1/shares/{id}/files-index (source=="sync-artifact"
+        AND non-empty sha256) and unwritable through PUT /sync-write."""
+        monkeypatch.setenv("WEB_PUBLISH_DOMAIN", "docs.test.com")
+        from app.core.config import get_settings
+
+        get_settings.cache_clear()
+
+        raw_key, _ = self._make_agent_key(db_session, folder_share, scopes="write")
+        content = "# Document 1\n\nThis is the content."
+        response = client.post(
+            f"/v1/web/shares/{folder_share.web_slug}/files?path=doc1.md",
+            json={"content": content},
+            headers={"X-Agent-Key": raw_key},
+        )
+        assert response.status_code == 200, response.text
+
+        db_session.refresh(folder_share)
+        items = folder_share.web_folder_items or []
+        entry = next(i for i in items if i.get("path") == "doc1.md")
+        expected_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        assert entry["sha256"] == expected_sha256
+        assert entry["size"] == len(content.encode("utf-8"))
+        assert entry["source"] == "sync-artifact"
+        assert entry["modified_at"]
+
+        read_key, _ = self._make_agent_key(db_session, folder_share, scopes="read")
+        index_resp = client.get(
+            f"/v1/shares/{folder_share.id}/files-index", headers={"X-Agent-Key": read_key}
+        )
+        assert index_resp.status_code == 200, index_resp.text
+        indexed = {item["path"]: item for item in index_resp.json()}
+        assert "doc1.md" in indexed, "pushed content must be visible through the sync protocol"
+        assert indexed["doc1.md"]["sha256"] == expected_sha256
+        assert indexed["doc1.md"]["updated_at"]
 
         get_settings.cache_clear()
 
@@ -1824,6 +1971,9 @@ class TestFolderItemsContentMerge:
                     "content": "# Original",
                     "storage_key": "web-assets/keep-key",
                     "sha256": "abc123",
+                    "size": 10,
+                    "modified_at": "2026-08-19T12:00:00+00:00",
+                    "source": "sync-artifact",
                 },
                 {
                     "path": "remove.md",
@@ -1845,7 +1995,13 @@ class TestFolderItemsContentMerge:
         folder_share: models.Share,
         test_user: models.User,
     ):
-        """AC1: PATCH with web_folder_items does not erase content/storage_key/sha256."""
+        """AC1: PATCH with web_folder_items does not erase content/storage_key/sha256/
+        size/modified_at/source. The last two were dropped by this merge (#d4c851af
+        finding 2) until sync_folder_file_content started stamping them: a routine
+        nav-tree-only PATCH — WebSyncManager fires one on every create/rename/delete —
+        would otherwise silently re-empty files-index's `updated_at` on the very next
+        sync, without touching sha256, so the symptom would reappear a moment after
+        being fixed."""
         token = self._login(client, test_user)
 
         r = client.patch(
@@ -1866,6 +2022,9 @@ class TestFolderItemsContentMerge:
         assert items["keep.md"].get("content") == "# Original"
         assert items["keep.md"].get("storage_key") == "web-assets/keep-key"
         assert items["keep.md"].get("sha256") == "abc123"
+        assert items["keep.md"].get("size") == 10
+        assert items["keep.md"].get("modified_at") == "2026-08-19T12:00:00+00:00"
+        assert items["keep.md"].get("source") == "sync-artifact"
 
     def test_patch_new_path_has_no_content(
         self,

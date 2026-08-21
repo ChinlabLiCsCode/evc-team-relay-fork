@@ -11,10 +11,13 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core import agent_key_scopes, security
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.db import models
 from app.schemas import share as share_schema
 from app.services import audit_service
 from app.utils import slug as slug_utils
+
+logger = get_logger(__name__)
 
 
 def get_web_url(share: models.Share) -> str | None:
@@ -290,7 +293,8 @@ def update_share(
         share.web_content = payload.web_content if payload.web_content else None
         share.web_content_updated_at = datetime.now(timezone.utc) if payload.web_content else None
 
-    # Handle web folder items update — MERGE to preserve content/source/storage_key/sha256
+    # Handle web folder items update — MERGE to preserve content/source/storage_key/
+    # sha256/size/modified_at
     if payload.web_folder_items is not None:
         old_has_items = share.web_folder_items is not None
         new_has_items = len(payload.web_folder_items) > 0
@@ -311,7 +315,11 @@ def update_share(
             for item in payload.web_folder_items:
                 new_item = item.model_dump()
                 existing = existing_by_path.get(new_item["path"], {})
-                for key in ("content", "source", "storage_key", "sha256"):
+                # #d4c851af finding 2: modified_at/size dropped here would silently
+                # re-empty files-index's `updated_at` on the very next nav-tree-only
+                # PATCH (WebSyncManager fires one on every create/rename/delete),
+                # undoing sync_folder_file_content's stamp without touching sha256.
+                for key in ("content", "source", "storage_key", "sha256", "size", "modified_at"):
                     if key in existing:
                         new_item[key] = existing[key]
                 new_items.append(new_item)
@@ -331,11 +339,36 @@ def update_share(
     if payload.web_content_updated_at is not None:
         share.web_content_updated_at = payload.web_content_updated_at
 
-    # Handle web doc_id update (y-sweet document ID for real-time sync)
+    # Handle web doc_id update (y-sweet document ID for real-time sync).
+    # `web_doc_id` is the storage key of the share's y-sweet document — the
+    # server signs it verbatim into the relay auth token (web.py). It is
+    # adopt-once: the plugin resends this field on every publish-toggle, so
+    # accepting a later, different value would silently repoint an already-
+    # live share at a DIFFERENT y-sweet document (content looks "vanished"
+    # to the user). Once a non-empty value is stored, it is immutable —
+    # a differing incoming value is ignored and logged, never applied
+    # (#54b07714).
     if payload.web_doc_id is not None:
-        old_doc_id = share.web_doc_id
-        changes["web_doc_id"] = {"old": old_doc_id is not None, "new": payload.web_doc_id != ""}
-        share.web_doc_id = payload.web_doc_id if payload.web_doc_id else None
+        if share.web_doc_id:
+            if payload.web_doc_id != share.web_doc_id:
+                logger.warning(
+                    "Ignoring attempt to change an already-set web_doc_id",
+                    extra={
+                        "share_id": str(share.id),
+                        "existing_web_doc_id": share.web_doc_id,
+                        "attempted_web_doc_id": payload.web_doc_id,
+                        "event": "web_doc_id_change_rejected",
+                    },
+                )
+                changes["web_doc_id"] = {
+                    "old": True,
+                    "new": True,
+                    "rejected_change": True,
+                }
+            # else: identical value resent (e.g. repeat publish-toggle) — no-op.
+        else:
+            changes["web_doc_id"] = {"old": False, "new": payload.web_doc_id != ""}
+            share.web_doc_id = payload.web_doc_id if payload.web_doc_id else None
 
     # TR-39: reject the RESULTING state of this update if it would leave the
     # share public + published with no content — regardless of which field(s)
