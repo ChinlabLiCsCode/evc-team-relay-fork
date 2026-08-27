@@ -3,3 +3,11 @@
 # into "#!/bin/bash\r") breaks them with a confusing "exec: no such file or directory"
 # error. Force LF regardless of platform or local autocrlf setting.
 *.sh text eol=lf
+
+# infra/plugin-mirror/: vendored third-party plugin build, distributed byte-for-byte
+# to end users' Obsidian installs. CRLF wouldn't break JS parsing the way it broke
+# the shell scripts above, but there's no reason to risk it or diff noise either —
+# keep these exactly as vendored.
+*.js text eol=lf
+*.json text eol=lf
+*.css text eol=lf
