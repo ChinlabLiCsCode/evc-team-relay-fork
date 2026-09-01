@@ -123,17 +123,23 @@ class TestWebPublishEndpoints:
         response = client.get("/v1/web/robots.txt")
         assert response.status_code == 404
 
-    def test_robots_txt_default_deny_all(
+    def test_robots_txt_no_indexable_shares_still_allows_crawl(
         self, client: TestClient, db_session: Session, test_user: models.User, monkeypatch
     ):
-        """Test robots.txt default behavior (deny all when no indexable shares)."""
+        """robots.txt is crawl control, not index control (#a38092aa/#ffbe9108):
+        `Allow: /` + the two service-path Disallows are unconditional -- they
+        do NOT depend on any share being indexable. This is the negative
+        control §0x requires: with zero indexable shares, `Sitemap:` and the
+        old `# Indexable shares` block must be ABSENT, while `Allow: /` is
+        still PRESENT. A bare `assert "Disallow: /" in content` would pass
+        against `Disallow: /api/` too, so assert on the exact line set."""
         # Enable web publishing for this test
         monkeypatch.setenv("WEB_PUBLISH_DOMAIN", "docs.test.com")
         from app.core.config import get_settings
 
         get_settings.cache_clear()
 
-        # Create a share with noindex=True (default)
+        # Create a share with noindex=True (default) -- not indexable.
         share = models.Share(
             kind=models.ShareKind.DOC,
             path="Test.md",
@@ -141,7 +147,7 @@ class TestWebPublishEndpoints:
             owner_user_id=test_user.id,
             web_published=True,
             web_slug="test-doc",
-            web_noindex=True,  # Not indexable
+            web_noindex=True,
         )
         db_session.add(share)
         db_session.commit()
@@ -149,28 +155,33 @@ class TestWebPublishEndpoints:
         response = client.get("/v1/web/robots.txt")
         assert response.status_code == 200
         assert response.headers["content-type"] == "text/plain; charset=utf-8"
-        content = response.text
-        assert "User-agent: *" in content
-        assert "Disallow: /" in content
-        # Should NOT have Allow rules
-        assert "Allow:" not in content
-        # Should NOT have sitemap
-        assert "Sitemap:" not in content
+        lines = response.text.splitlines()
+        assert "User-agent: *" in lines
+        assert "Allow: /" in lines
+        assert "Disallow: /api/" in lines
+        assert "Disallow: /login" in lines
+        # Crawling is unconditional now -- no bare "Disallow: /" line either.
+        assert "Disallow: /" not in lines
+        # Nothing to index -> no positive signal, and the old per-slug
+        # enumeration block is gone entirely.
+        assert not any(line.startswith("Sitemap:") for line in lines)
+        assert "# Indexable shares" not in response.text
+        assert "test-doc" not in response.text
 
-        # Clean up
         get_settings.cache_clear()
 
-    def test_robots_txt_with_indexable_shares(
+    def test_robots_txt_sitemap_line_present_when_indexable_shares_exist(
         self, client: TestClient, db_session: Session, test_user: models.User, monkeypatch
     ):
-        """Test robots.txt includes Allow rules for indexable shares."""
-        # Enable web publishing for this test
+        """Positive control for the above: an indexable share adds the
+        `Sitemap:` pointer, but robots.txt no longer enumerates any
+        per-share `Allow: /{slug}` line -- that population moved entirely
+        to sitemap.xml, which already carries its own coverage below."""
         monkeypatch.setenv("WEB_PUBLISH_DOMAIN", "docs.test.com")
         from app.core.config import get_settings
 
         get_settings.cache_clear()
 
-        # Create indexable share
         share1 = models.Share(
             kind=models.ShareKind.DOC,
             path="Public/Doc1.md",
@@ -180,18 +191,7 @@ class TestWebPublishEndpoints:
             web_slug="public-doc-1",
             web_noindex=False,  # Indexable
         )
-        # Create another indexable share
         share2 = models.Share(
-            kind=models.ShareKind.DOC,
-            path="Public/Doc2.md",
-            visibility=models.ShareVisibility.PUBLIC,
-            owner_user_id=test_user.id,
-            web_published=True,
-            web_slug="public-doc-2",
-            web_noindex=False,  # Indexable
-        )
-        # Create non-indexable share
-        share3 = models.Share(
             kind=models.ShareKind.DOC,
             path="Private/Doc.md",
             visibility=models.ShareVisibility.PRIVATE,
@@ -200,35 +200,37 @@ class TestWebPublishEndpoints:
             web_slug="private-doc",
             web_noindex=True,  # Not indexable
         )
-        db_session.add_all([share1, share2, share3])
+        db_session.add_all([share1, share2])
         db_session.commit()
 
         response = client.get("/v1/web/robots.txt")
         assert response.status_code == 200
-        content = response.text
+        lines = response.text.splitlines()
 
-        # Should have default deny
-        assert "User-agent: *" in content
-        assert "Disallow: /" in content
+        assert "User-agent: *" in lines
+        assert "Allow: /" in lines
+        assert "Disallow: /api/" in lines
+        assert "Disallow: /login" in lines
+        assert "Sitemap: https://docs.test.com/sitemap.xml" in lines
 
-        # Should have Allow rules for indexable shares
-        assert "Allow: /public-doc-1" in content
-        assert "Allow: /public-doc-2" in content
-        # Should NOT include private share
-        assert "private-doc" not in content
+        # No slug of any share -- indexable or not -- is ever listed anymore.
+        assert "public-doc-1" not in response.text
+        assert "private-doc" not in response.text
+        assert not any(line.startswith("Allow: /") and line != "Allow: /" for line in lines)
 
-        # Should have sitemap reference
-        assert "Sitemap: https://docs.test.com/sitemap.xml" in content
-
-        # Clean up
         get_settings.cache_clear()
 
-    def test_robots_txt_excludes_non_public_visibility(
+    def test_robots_txt_never_lists_share_slugs_regardless_of_visibility(
         self, client: TestClient, db_session: Session, test_user: models.User, monkeypatch
     ):
-        """TR-44: web_published+web_noindex=false alone must not make a share
-        crawlable — visibility must also be PUBLIC. A private (or protected)
-        share flipped to published+indexable must not leak its slug."""
+        """TR-44's leak this test used to guard against (a private/protected
+        published+indexable share's slug appearing in robots.txt) can no
+        longer occur by construction -- robots.txt doesn't enumerate share
+        slugs at all after #ffbe9108. Kept as a regression guard: mixed
+        visibility shares must still produce zero slug leakage, whatever the
+        mechanism. The equivalent visibility filter for sitemap.xml (which
+        DOES still enumerate shares) is separately covered by
+        test_sitemap_xml_excludes_non_public_visibility below -- unweakened."""
         monkeypatch.setenv("WEB_PUBLISH_DOMAIN", "docs.test.com")
         from app.core.config import get_settings
 
@@ -241,7 +243,7 @@ class TestWebPublishEndpoints:
             owner_user_id=test_user.id,
             web_published=True,
             web_slug="leaky-private-doc",
-            web_noindex=False,  # would be indexable if visibility weren't checked
+            web_noindex=False,
         )
         leaky_protected = models.Share(
             kind=models.ShareKind.DOC,
@@ -271,7 +273,8 @@ class TestWebPublishEndpoints:
 
         assert "leaky-private-doc" not in content
         assert "leaky-protected-doc" not in content
-        assert "Allow: /genuinely-public-doc" in content
+        assert "genuinely-public-doc" not in content
+        assert "Allow: /" in content.splitlines()
 
         get_settings.cache_clear()
 
@@ -807,9 +810,11 @@ class TestProtectedShareAuth:
     def test_get_protected_share_without_auth(
         self, client: TestClient, protected_share: models.Share
     ):
-        """Test that protected share metadata can be fetched without auth."""
-        # This endpoint only returns metadata, not content
-        # The frontend will then prompt for password
+        """With web publishing disabled (the default in this fixture) the
+        endpoint 404s before reaching any auth logic -- this proves only the
+        disabled-service short-circuit, NOT what gets returned to an
+        unauthenticated caller when publishing IS enabled. See
+        TestProtectedShareMetadataGating below for that (#92840c94)."""
         response = client.get(f"/v1/web/shares/{protected_share.web_slug}")
 
         # Should return 404 because web publishing is disabled by default
@@ -1659,6 +1664,94 @@ class TestPrivateShareWebAuthMetadata:
         )
         assert response.status_code == 200
         assert "content-security-policy" not in response.headers
+
+
+class TestProtectedShareMetadataGating:
+    """PROTECTED share web access: does the root metadata endpoint leak the
+    folder tree / doc content before the password auth (#92840c94)?
+
+    Live prod measured 2026-08-31: `GET docs.entire.vc/<protected-folder-slug>`
+    returned 200 with the full document-name tree rendered anonymously, while
+    every CHILD path (`GET .../<doc>`, served by get_folder_file_content
+    above) correctly 403s without a web_session cookie. get_share_by_slug has
+    an explicit strip-until-authenticated branch for PRIVATE but never had
+    one for PROTECTED -- an omission, not a decision: nothing in this file's
+    docstrings, this router's other PROTECTED-gated endpoints (all of which
+    check `request.cookies.get("web_session")` +
+    `WebSessionService.validate_web_session`), or the frontend
+    (`apps/web-publish/src/routes/[slug]/+page.server.ts`) documents
+    exposing the tree pre-auth as intentional."""
+
+    @pytest.fixture
+    def protected_folder_share(self, db_session: Session, test_user: models.User) -> models.Share:
+        share = models.Share(
+            kind=models.ShareKind.FOLDER,
+            path="Protected/Folder",
+            visibility=models.ShareVisibility.PROTECTED,
+            owner_user_id=test_user.id,
+            web_published=True,
+            web_slug="protected-folder-share",
+            password_hash=get_password_hash("test123"),
+            web_folder_items=[
+                {"path": "Secret Plan.md", "name": "Secret Plan.md", "type": "doc"},
+            ],
+        )
+        db_session.add(share)
+        db_session.commit()
+        db_session.refresh(share)
+        return share
+
+    def test_protected_share_without_auth_does_not_leak_folder_tree(
+        self,
+        client: TestClient,
+        protected_folder_share: models.Share,
+        monkeypatch,
+    ):
+        """The bug this card is about: without a web_session cookie, the
+        folder tree (and thus every document's name) must NOT be returned."""
+        monkeypatch.setattr("app.api.routers.web.get_settings", lambda: _web_enabled_settings())
+        response = client.get(f"/v1/web/shares/{protected_folder_share.web_slug}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["visibility"] == "protected"
+        assert data["web_folder_items"] is None
+
+    def test_protected_share_with_valid_session_returns_folder_tree(
+        self,
+        client: TestClient,
+        protected_folder_share: models.Share,
+        monkeypatch,
+    ):
+        """Positive control: a valid web_session cookie (obtained via
+        POST .../auth) still gets the real tree -- the fix must not also
+        break the authenticated path."""
+        monkeypatch.setattr("app.api.routers.web.get_settings", lambda: _web_enabled_settings())
+        token = WebSessionService.create_web_session(protected_folder_share.id, hours=24)
+        response = client.get(
+            f"/v1/web/shares/{protected_folder_share.web_slug}",
+            cookies={"web_session": token},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["web_folder_items"] is not None
+        assert data["web_folder_items"][0]["path"] == "Secret Plan.md"
+
+    def test_protected_share_with_invalid_session_does_not_leak_folder_tree(
+        self,
+        client: TestClient,
+        protected_folder_share: models.Share,
+        monkeypatch,
+    ):
+        """A garbage/expired cookie must be treated the same as no cookie --
+        not raise, not leak."""
+        monkeypatch.setattr("app.api.routers.web.get_settings", lambda: _web_enabled_settings())
+        response = client.get(
+            f"/v1/web/shares/{protected_folder_share.web_slug}",
+            cookies={"web_session": "not-a-real-token"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["web_folder_items"] is None
 
 
 class TestPrivateShareWebAuth:
