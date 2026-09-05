@@ -6,11 +6,13 @@ import time
 import uuid
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.clients.billing_client import BillingClient, BillingServiceError
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.db import models
 from app.services.billing_stub import (
     _format_entitlement_value,
     cancel_stub_subscription,
@@ -28,6 +30,104 @@ _CACHE_TTL_SECONDS = 300  # 5 minutes
 
 # Singleton billing client (lazy init)
 _billing_client: BillingClient | None = None
+
+
+def get_billing_identity(db: Session, user: models.User) -> str:
+    """Resolve the identity string sent to Billing Service for a user.
+
+    Priority: users.casdoor_id (rarely set — see models.py, a 02/2026
+    billing-pilot rudiment no code path writes) -> the user's linked OAuth
+    provider_user_id -> the internal user.id as a last resort for users with
+    neither. find_user_by_billing_identity() below is the exact reverse of
+    this, tried in the same order, so a webhook can always resolve back to
+    the user whatever form this function used when the identity was sent.
+    """
+    if user.casdoor_id:
+        return user.casdoor_id
+    oauth = db.query(models.UserOAuthAccount).filter_by(user_id=user.id).first()
+    if oauth:
+        return oauth.provider_user_id
+    return str(user.id)
+
+
+def find_user_by_billing_identity(db: Session, identity: str) -> models.User | None:
+    """Reverse of get_billing_identity(): resolve a User from an identity
+    string Billing Service echoes back in a webhook payload. Tries the same
+    three forms get_billing_identity() can produce, in the same order —
+    without this, a lookup keyed on casdoor_id alone misses the ~87% of
+    users whose identity was actually sent as their OAuth provider_user_id.
+
+    users.casdoor_id IS globally unique at the DB level (a real unique
+    index, ix_users_casdoor_id — see models.py) so that branch can never
+    match more than one row. provider_user_id is different: the schema's
+    uq_provider_user constraint is composite, (provider_id,
+    provider_user_id) — the same subject string legitimately CAN exist
+    under two different providers once a second one is configured. See
+    _resolve_oauth_account_by_provider_user_id() for how that's resolved
+    deterministically instead of letting scalar_one_or_none() raise
+    MultipleResultsFound (#1ccd7956).
+    """
+    user = db.execute(
+        select(models.User).where(models.User.casdoor_id == identity)
+    ).scalar_one_or_none()
+    if user:
+        return user
+
+    oauth = _resolve_oauth_account_by_provider_user_id(db, identity)
+    if oauth:
+        return db.execute(
+            select(models.User).where(models.User.id == oauth.user_id)
+        ).scalar_one_or_none()
+
+    try:
+        user_uuid = uuid.UUID(identity)
+    except ValueError:
+        return None
+    return db.execute(select(models.User).where(models.User.id == user_uuid)).scalar_one_or_none()
+
+
+def _resolve_oauth_account_by_provider_user_id(
+    db: Session, provider_user_id: str
+) -> models.UserOAuthAccount | None:
+    """Resolve a UserOAuthAccount by provider_user_id alone, deterministically.
+
+    provider_user_id is only unique paired with provider_id (uq_provider_user
+    in models.py) — with more than one OAuth provider configured, the same
+    subject string can legitimately match rows under different providers,
+    and a plain scalar_one_or_none() would raise MultipleResultsFound (a
+    real prod incident shape: a webhook that used to silently lose data
+    would start hard-failing with a 500 instead, the moment a second
+    provider is added).
+
+    Prefers the provider actually configured for OAuth
+    (settings.oauth_provider_name — the same one get_billing_identity()
+    read from when this identity was originally sent), falling back to
+    created_at for a stable order among any remaining ties. Logs when more
+    than one candidate existed, since silently picking one is still a
+    judgment call worth being able to find in the logs later.
+    """
+    settings = get_settings()
+    stmt = (
+        select(models.UserOAuthAccount)
+        .join(models.OAuthProvider)
+        .where(models.UserOAuthAccount.provider_user_id == provider_user_id)
+        .order_by(
+            models.OAuthProvider.name != settings.oauth_provider_name,
+            models.UserOAuthAccount.created_at,
+        )
+    )
+    matches = list(db.execute(stmt).scalars().all())
+    if len(matches) > 1:
+        logger.warning(
+            "provider_user_id matched multiple OAuth accounts across providers; "
+            "using the one on the configured OAuth provider (or the oldest)",
+            extra={
+                "provider_user_id": provider_user_id,
+                "match_count": len(matches),
+                "resolved_provider_id": str(matches[0].provider_id),
+            },
+        )
+    return matches[0] if matches else None
 
 
 def _get_limit(entitlements: dict[str, Any], key: str) -> int | None:
@@ -95,8 +195,7 @@ class VisibilityNotAllowedError(Exception):
         self.allowed = allowed
         self.plan = plan
         super().__init__(
-            f"Visibility '{visibility}' not allowed on plan {plan}. "
-            f"Allowed: {', '.join(allowed)}"
+            f"Visibility '{visibility}' not allowed on plan {plan}. Allowed: {', '.join(allowed)}"
         )
 
 
