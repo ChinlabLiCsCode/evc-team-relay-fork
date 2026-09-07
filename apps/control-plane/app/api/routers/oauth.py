@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.core.metrics import OAUTH_LOGINS_TOTAL
 from app.db import models
 from app.db.session import get_db
@@ -274,7 +275,7 @@ async def callback(
         user_id=user.id,
         device_name=f"OAuth ({provider})",
         user_agent=request.headers.get("user-agent"),
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         expires_days=settings.refresh_token_expire_days,
     )
 
@@ -285,7 +286,7 @@ async def callback(
         db=db,
         action=models.AuditAction.OAUTH_LOGIN,
         actor_user_id=user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         details={
             "provider": provider,
@@ -303,7 +304,7 @@ async def callback(
         db,
         user,
         f"OAuth ({provider})",
-        request.client.host if request.client else None,
+        get_client_ip(request),
         request.headers.get("user-agent"),
     )
 

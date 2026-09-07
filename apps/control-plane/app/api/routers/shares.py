@@ -22,6 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.api import deps
 from app.core import agent_key_scopes, security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.core.path_validation import validate_relative_path
 from app.db import models
 from app.db.session import get_db
@@ -111,7 +112,7 @@ async def create_share(
 
     # Queue notifications (queues to DB, actual delivery is async via workers)
     notification_service = get_notification_service()
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     await notification_service.notify_share_created(db, share, current_user, ip_address, user_agent)
@@ -990,7 +991,7 @@ async def update_share(
     # Queue notifications
     if changes:
         notification_service = get_notification_service()
-        ip_address = request.client.host if request.client else None
+        ip_address = get_client_ip(request)
         user_agent = request.headers.get("user-agent")
 
         await notification_service.notify_share_updated(
@@ -1018,7 +1019,7 @@ async def delete_share(
 
     # Queue notifications before deletion (will email members)
     notification_service = get_notification_service()
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     await notification_service.notify_share_deleted(
@@ -1082,7 +1083,7 @@ async def add_member(
 
     if member:
         notification_service = get_notification_service()
-        ip_address = request.client.host if request.client else None
+        ip_address = get_client_ip(request)
         user_agent = request.headers.get("user-agent")
 
         await notification_service.notify_member_added(
@@ -1125,7 +1126,7 @@ async def update_member_role(
 
     if member and old_role:
         notification_service = get_notification_service()
-        ip_address = request.client.host if request.client else None
+        ip_address = get_client_ip(request)
         user_agent = request.headers.get("user-agent")
 
         await notification_service.notify_member_updated(
@@ -1159,7 +1160,7 @@ async def remove_member(
 
     # Queue notification before deletion
     notification_service = get_notification_service()
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     await notification_service.notify_member_removed(

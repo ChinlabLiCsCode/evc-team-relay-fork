@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.core import agent_key_scopes, security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.core.path_validation import validate_relative_path
 from app.db import models
 from app.db.session import get_db
@@ -1280,7 +1281,7 @@ async def upload_mesh_artifact(
             "key_id": str(agent_key.id),
             "share_id": str(share.id),
             "path": path,
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 
@@ -1702,7 +1703,7 @@ async def sync_upload(
             "share_id": str(share.id),
             "path": path,
             "sha256": sha256,
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 

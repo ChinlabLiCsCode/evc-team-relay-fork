@@ -906,7 +906,13 @@ class EmailService:
         html_body, text_body = self._render_template(
             "security-new-session",
             {
-                "device_name": device_name or "Unknown device",
+                # X-Device-Name is optional and no client we ship (curl, our own
+                # web UI, the Obsidian plugin) sends it — falling back to a fixed
+                # "Unknown device" string threw away the one signal we always do
+                # have, the User-Agent, and made every real alert say "Unknown"
+                # (TR follow-up to #228403f8). "curl/8.5.0" / "obsidian/1.6.7" is
+                # more honest than a fixed placeholder even unparsed.
+                "device_name": device_name or user_agent or "Unknown device",
                 "ip_address": ip_address or "Unknown",
                 "user_agent": user_agent or "Unknown",
                 "recipient_email": to_email,
@@ -916,7 +922,7 @@ class EmailService:
         if not text_body:
             text_body = (
                 f"A new login was detected on your account.\n\n"
-                f"Device: {device_name or 'Unknown'}\n"
+                f"Device: {device_name or user_agent or 'Unknown'}\n"
                 f"IP Address: {ip_address or 'Unknown'}\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                 f"If this wasn't you, please change your password immediately."

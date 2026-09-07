@@ -9,6 +9,7 @@ from typing import Callable
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.core.http import get_client_ip
 from app.core.logging import clear_request_context, get_logger, set_request_context
 
 logger = get_logger(__name__)
@@ -43,7 +44,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         start_time = time.time()
 
         # Extract client info
-        client_host = request.client.host if request.client else "unknown"
+        client_host = get_client_ip(request) or "unknown"
         user_agent = request.headers.get("user-agent", "unknown")
 
         try:

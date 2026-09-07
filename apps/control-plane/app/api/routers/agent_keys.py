@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.core import security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.db import models
 from app.db.session import get_db
 
@@ -215,7 +216,7 @@ def create_agent_key(
             "expires_at": agent_key.expires_at.isoformat(),
             "default_ttl_applied": payload.expires_at is None,
             "scopes": agent_key.scopes,
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 
@@ -307,7 +308,7 @@ def revoke_agent_key(
                 "key_id": key_id,
                 "share_id": share_id,
                 "revoked_by": str(user_id),
-                "ip": request.client.host if request.client else None,
+                "ip": get_client_ip(request),
             },
         )
 
@@ -382,7 +383,7 @@ def update_agent_key_scopes(
             "previous_scopes": previous,
             "new_scopes": agent_key.scopes,
             "updated_by": str(user_id),
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 

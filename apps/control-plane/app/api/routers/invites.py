@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.api import deps
 from app.core import security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.db import models
 from app.db.session import get_db
 from app.schemas import invite as invite_schema
@@ -64,7 +65,7 @@ async def create_invite(
     invite_url = f"{base_url}/invite/{invite.token}/page"
 
     notification_service = get_notification_service()
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     # If invite has email field, send notification to that email
@@ -117,7 +118,7 @@ async def revoke_invite(
     # Queue notification
     if invite:
         notification_service = get_notification_service()
-        ip_address = request.client.host if request.client else None
+        ip_address = get_client_ip(request)
         user_agent = request.headers.get("user-agent")
 
         await notification_service.notify_invite_revoked(
@@ -175,7 +176,7 @@ async def redeem_invite(
 
         if redeemer and share and owner:
             notification_service = get_notification_service()
-            ip_address = request.client.host if request.client else None
+            ip_address = get_client_ip(request)
             user_agent = request.headers.get("user-agent")
 
             await notification_service.notify_invite_redeemed(
@@ -328,7 +329,7 @@ def accept_invite(
             auth_service.log_login(
                 db,
                 user,
-                request.client.host if request.client else None,
+                get_client_ip(request),
                 request.headers.get("user-agent"),
             )
 
