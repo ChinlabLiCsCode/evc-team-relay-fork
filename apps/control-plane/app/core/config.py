@@ -220,6 +220,15 @@ class Settings(BaseSettings):
     )
     billing_base_url: str = Field(default="https://billing.entire.vc/api/v1")
     billing_service_token: str = Field(default="")
+    billing_service_id: str = Field(
+        default="relay",
+        description=(
+            "service_id this instance identifies as to the Billing Service. "
+            "The international deployment must keep the default 'relay' -- "
+            "only a self-hosted deployment with its own catalog (e.g. the RU "
+            "instance's 'relay-ru') overrides it."
+        ),
+    )
     billing_webhook_secret: str = Field(default="")
     billing_grace_period_days: int = Field(default=7)
     billing_return_url: str = Field(default="", description="Return URL after checkout")

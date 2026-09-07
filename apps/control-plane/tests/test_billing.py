@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import time
 import uuid
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.clients.billing_client import BillingClient
 from app.core.config import get_settings
 from app.services import billing_service, billing_stub, usage_service
 
@@ -1414,3 +1417,154 @@ class TestNonStubModeMocksExternalBillingClient:
             )
             assert result["checkout_url"] == "https://billing.entire.vc/checkout/abc"
             mock_client.create_subscription.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# BillingClient service_id configurability (#9d31cdcd). The international
+# deployment hardcoded "relay" in FOUR request sites in billing_client.py
+# (constructor header, get_products params, get_entitlements URL path,
+# create_portal_session payload) plus a fifth in billing_service.py's
+# checkout payload -- a self-hosted deployment with its own catalog (the RU
+# instance's "relay-ru") would silently keep asking for the international
+# one. These are direct unit tests against the real BillingClient class with
+# httpx.MockTransport (built into httpx, no new dependency) standing in for
+# the network, so they exercise BillingClient's actual request construction
+# -- an AsyncMock at the service-layer boundary (as used elsewhere in this
+# file) would never touch that code at all.
+# ---------------------------------------------------------------------------
+
+
+class TestBillingClientServiceIdConfigurable:
+    def _client_with_capture(self, service_id: str | None = None):
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/portal-sessions":
+                return httpx.Response(200, json={"portal_url": "https://x/portal"})
+            return httpx.Response(200, json={})
+
+        kwargs: dict[str, str] = {"base_url": "https://billing.example", "service_token": "tok"}
+        if service_id is not None:
+            kwargs["service_id"] = service_id
+        client = BillingClient(**kwargs)
+        client._client._transport = httpx.MockTransport(handler)
+        return client, captured
+
+    @pytest.mark.asyncio
+    async def test_default_service_id_is_relay_across_all_call_sites(self):
+        """No BILLING_SERVICE_ID override -- every outgoing request must
+        still say "relay", byte for byte the pre-existing behavior. This is
+        the international-deployment regression guard: the fix must not
+        change default behavior.
+        """
+        client, captured = self._client_with_capture()
+
+        await client.get_products()
+        await client.get_entitlements("user-1")
+        await client.create_portal_session("user-1", "https://return")
+
+        assert captured[0].headers["X-Service-Id"] == "relay"  # constructor header, every request
+        assert captured[0].url.params["service_id"] == "relay"  # get_products
+        assert captured[1].url.path == "/entitlements/user-1/relay"  # get_entitlements path segment
+        assert (
+            json.loads(captured[2].content)["service_id"] == "relay"
+        )  # create_portal_session payload
+
+    @pytest.mark.asyncio
+    async def test_relay_ru_override_reaches_all_four_call_sites(self):
+        """BILLING_SERVICE_ID=relay-ru must reach every one of the four
+        billing_client.py sites, not just the /products catalog lookup.
+        """
+        client, captured = self._client_with_capture(service_id="relay-ru")
+
+        await client.get_products()
+        await client.get_entitlements("user-1")
+        await client.create_portal_session("user-1", "https://return")
+
+        assert captured[0].headers["X-Service-Id"] == "relay-ru"
+        assert captured[0].url.params["service_id"] == "relay-ru"
+        assert captured[1].url.path == "/entitlements/user-1/relay-ru"
+        assert json.loads(captured[2].content)["service_id"] == "relay-ru"
+
+
+class TestCreateCheckoutSessionServiceId:
+    """billing_service.create_checkout_session builds its own payload dict
+    (the fifth site, separate from BillingClient) -- needs its own test
+    since TestBillingClientServiceIdConfigurable never touches this file.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _non_stub(self):
+        os.environ["BILLING_STUB_MODE"] = "false"
+        os.environ["BILLING_SERVICE_TOKEN"] = "test-service-token"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        yield
+        os.environ["BILLING_STUB_MODE"] = "true"
+        os.environ.pop("BILLING_SERVICE_TOKEN", None)
+        os.environ.pop("BILLING_SERVICE_ID", None)
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+
+    @pytest.mark.asyncio
+    async def test_default_checkout_payload_uses_relay(self):
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.create_subscription.return_value = {
+                "checkout_url": "https://x",
+                "id": "sub_1",
+            }
+            mock_get_client.return_value = mock_client
+
+            class _FakeUser:
+                billing_subscription_id = None
+
+            class _FakeDb:
+                def commit(self):
+                    pass
+
+            await billing_service.create_checkout_session(
+                "cid", {"product_id": "prod_x"}, _FakeDb(), _FakeUser()
+            )
+            payload = mock_client.create_subscription.call_args.args[0]
+            assert payload["service_id"] == "relay"
+
+    @pytest.mark.asyncio
+    async def test_relay_ru_checkout_payload_uses_override(self):
+        os.environ["BILLING_SERVICE_ID"] = "relay-ru"
+        get_settings.cache_clear()
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.create_subscription.return_value = {
+                "checkout_url": "https://x",
+                "id": "sub_1",
+            }
+            mock_get_client.return_value = mock_client
+
+            class _FakeUser:
+                billing_subscription_id = None
+
+            class _FakeDb:
+                def commit(self):
+                    pass
+
+            await billing_service.create_checkout_session(
+                "cid", {"product_id": "prod_x"}, _FakeDb(), _FakeUser()
+            )
+            payload = mock_client.create_subscription.call_args.args[0]
+            assert payload["service_id"] == "relay-ru"
+
+    @pytest.mark.asyncio
+    async def test_get_billing_client_singleton_threads_configured_service_id(self):
+        """The singleton constructor (_get_billing_client) is what actually
+        wires settings.billing_service_id into BillingClient -- a test that
+        only mocks _get_billing_client itself (as the tests above do) can't
+        see this wiring; patch BillingClient one layer down instead.
+        """
+        os.environ["BILLING_SERVICE_ID"] = "relay-ru"
+        get_settings.cache_clear()
+        with patch("app.services.billing_service.BillingClient") as MockBillingClient:
+            billing_service._get_billing_client()
+            _, kwargs = MockBillingClient.call_args
+            assert kwargs["service_id"] == "relay-ru"

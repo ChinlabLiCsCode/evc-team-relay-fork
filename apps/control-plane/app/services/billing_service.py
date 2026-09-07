@@ -207,6 +207,7 @@ def _get_billing_client() -> BillingClient:
         _billing_client = BillingClient(
             base_url=settings.billing_base_url,
             service_token=settings.billing_service_token,
+            service_id=settings.billing_service_id,
         )
     return _billing_client
 
@@ -513,7 +514,7 @@ async def create_checkout_session(
 
     # Prepare payload with required fields
     full_payload = {
-        "service_id": "relay",
+        "service_id": settings.billing_service_id,
         "user_id": casdoor_id,
         "product_id": payload.get("product_id"),
         "price_id": payload.get("price_id"),

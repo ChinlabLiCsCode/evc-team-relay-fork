@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.config import get_settings
+
 STUB_PLANS: dict[str, dict[str, Any]] = {
     "free": {
         "product_id": "prod_relay_free",
@@ -71,6 +73,7 @@ async def get_stub_plans() -> list[dict[str, Any]]:
     (#b4a7e703; not a regression of #0689a244, a distinct client/server
     schema mismatch).
     """
+    service_id = get_settings().billing_service_id
     plans = []
     for key, plan in STUB_PLANS.items():
         price = plan["price"]
@@ -78,7 +81,7 @@ async def get_stub_plans() -> list[dict[str, Any]]:
             {
                 "id": plan["product_id"],
                 "name": plan["name"],
-                "service_id": "relay",
+                "service_id": service_id,
                 "type": "subscription",
                 "status": "active",
                 "prices": [
