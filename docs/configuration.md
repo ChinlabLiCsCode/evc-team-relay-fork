@@ -45,7 +45,7 @@ These create the first admin user when the database is empty.
 | `RELAY_PRIVATE_KEY` | **Yes** | — | Base64-encoded Ed25519 private key used to sign relay tokens. Startup **fails closed** without it (`RELAY_PRIVATE_KEY is required but not set`) — no key is generated for you. Create it once with `openssl genpkey -algorithm ed25519 -out relay_private.pem && openssl base64 -A -in relay_private.pem`, then back it up: replacing it invalidates every token already issued and requires updating `[[auth]] public_key` in `relay.toml`. |
 | `RELAY_KEY_ID` | No | `relay_cp_dev` | COSE `kid` embedded in issued tokens; must match a `[[auth]] key_id` in `relay.toml` |
 | `RELAY_AUDIENCE` | No | derived from `RELAY_PUBLIC_URL`'s host as `https://{host}` | `aud` claim on issued tokens — must equal `relay.toml`'s `[server].url` exactly. Set explicitly only if your `[server].url` uses a different host than `RELAY_PUBLIC_URL`. |
-| `RELAY_TOKEN_ISSUER` | No | `relay-server` | `iss` claim on issued tokens. Must be one of relay-server's accepted issuers (`relay-server`, `auth.system3.dev`, `auth.system3.md` as of image `0.9.9`) — leave at the default unless you know your relay-server image accepts a different value. |
+| `RELAY_TOKEN_ISSUER` | No | `relay-server` | `iss` claim on issued tokens. Must be one of the issuers your relay-server image accepts — leave at the default unless you know it accepts a different value. |
 
 ## Logging
 

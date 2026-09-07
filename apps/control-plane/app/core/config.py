@@ -92,10 +92,9 @@ class Settings(BaseSettings):
         description=(
             "'iss' claim on issued CWT tokens. relay-server (ghcr.io/entire-vc/"
             "evc-relay-server, crates/y-sweet-core/src/auth.rs VALID_ISSUERS) only accepts "
-            "'relay-server', 'auth.system3.dev', or 'auth.system3.md' as of image 0.9.9 — "
-            "the semantically accurate 'relay-control-plane' is NOT in that allowlist. Keep "
-            "the default until relay-server's allowlist is extended; do not hardcode "
-            "'relay-control-plane' in code."
+            "a short allowlist of issuer names. The default below is in it; the semantically "
+            "accurate 'relay-control-plane' is NOT. Keep the default until the allowlist is "
+            "extended; do not hardcode 'relay-control-plane' in code."
         ),
     )
 

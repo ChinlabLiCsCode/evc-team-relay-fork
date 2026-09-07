@@ -27,12 +27,13 @@ from app.core.security import (
     verify_relay_token_cwt,
 )
 
-# Mirrors relay-server's own allowlist (ghcr.io/entire-vc/evc-relay-server,
-# crates/y-sweet-core/src/auth.rs VALID_ISSUERS, as of image 0.9.9). Not
-# imported from there — different repo/language — so this is a deliberate
-# duplicate, not a shared source of truth; if relay-server's allowlist ever
-# changes, this constant must be updated by hand (#7908e17e).
-RELAY_SERVER_VALID_ISSUERS = ("relay-server", "auth.system3.dev", "auth.system3.md")
+# The issuer we actually mint with, and the only one we rely on. relay-server
+# (ghcr.io/entire-vc/evc-relay-server, crates/y-sweet-core/src/auth.rs
+# VALID_ISSUERS) still accepts a couple of inherited legacy names; we
+# deliberately do not list them here, and narrowing that allowlist on the
+# server is tracked separately. Asserting membership in this narrower tuple is
+# strictly stronger than asserting membership in the server's own list.
+RELAY_SERVER_VALID_ISSUERS = ("relay-server",)
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -241,8 +242,8 @@ class TestCWTClaims:
     def test_has_exp_claim(self):
         """exp (4) must be present for TTL enforcement (H6 security requirement).
 
-        NOTE: relay-server (System3) MUST be verified to accept and enforce exp.
-        If System3 rejects exp, file a System3 bug — do NOT remove exp from here.
+        NOTE: relay-server MUST be verified to accept and enforce exp.
+        If it rejects exp, that is a relay-server bug — do NOT remove exp from here.
         """
         private_key, _ = _make_keypair()
         token = create_relay_token_cwt(private_key, "k1", "doc-123", "write", 60)
