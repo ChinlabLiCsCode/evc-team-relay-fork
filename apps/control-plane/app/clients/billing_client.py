@@ -71,12 +71,13 @@ def _parse_billing_error(e: httpx.HTTPStatusError) -> BillingServiceError:
 class BillingClient:
     """Async client for Billing Service API."""
 
-    def __init__(self, base_url: str, service_token: str):
+    def __init__(self, base_url: str, service_token: str, service_id: str = "relay"):
+        self._service_id = service_id
         self._client = httpx.AsyncClient(
             base_url=base_url,
             headers={
                 "Authorization": f"Bearer {service_token}",
-                "X-Service-Id": "relay",
+                "X-Service-Id": service_id,
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
@@ -86,7 +87,7 @@ class BillingClient:
     async def get_entitlements(self, user_id: str) -> dict[str, Any]:
         """Get user entitlements from Billing Service."""
         try:
-            resp = await self._client.get(f"/entitlements/{user_id}/relay")
+            resp = await self._client.get(f"/entitlements/{user_id}/{self._service_id}")
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
@@ -97,7 +98,7 @@ class BillingClient:
         try:
             resp = await self._client.get(
                 "/products",
-                params={"service_id": "relay"},
+                params={"service_id": self._service_id},
             )
             resp.raise_for_status()
             return resp.json()
@@ -182,7 +183,7 @@ class BillingClient:
                 "/portal-sessions",
                 json={
                     "user_id": user_id,
-                    "service_id": "relay",
+                    "service_id": self._service_id,
                     "return_url": return_url,
                 },
             )
