@@ -1,0 +1,9 @@
+We couldn't process your payment
+
+The most recent charge for your subscription on {{ server_name }} did not go through.
+
+Please update your payment method to keep your subscription active. If the payment
+keeps failing, your plan may be downgraded once your current billing period ends.
+
+--
+{{ server_name }}

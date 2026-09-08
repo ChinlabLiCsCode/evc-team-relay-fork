@@ -42,6 +42,9 @@ EMAIL_TYPE_SECURITY_NEW_SESSION = "security_new_session"
 EMAIL_TYPE_SECURITY_PASSWORD_CHANGED = "security_password_changed"
 EMAIL_TYPE_LIFECYCLE_NO_SHARE_24H = "lifecycle_no_share_24h"
 EMAIL_TYPE_LIFECYCLE_INACTIVE_AFTER_SHARE = "lifecycle_inactive_after_share"
+EMAIL_TYPE_BILLING_CANCELLATION_DELETION_SCHEDULED = "billing_cancellation_deletion_scheduled"
+EMAIL_TYPE_BILLING_CANCELLATION_DELETION_EXECUTED = "billing_cancellation_deletion_executed"
+EMAIL_TYPE_BILLING_PAYMENT_FAILED = "billing_payment_failed"
 
 # Retry intervals for email queue (seconds). TR-35: matches the webhook
 # worker's schedule (webhook_service.RETRY_INTERVALS) — 3 attempts over
@@ -981,6 +984,106 @@ class EmailService:
             text_body,
             html_body or text_body,
             EMAIL_TYPE_SECURITY_PASSWORD_CHANGED,
+        )
+        return True
+
+    async def send_billing_cancellation_deletion_scheduled(
+        self,
+        db: Session,
+        to_email: str,
+        deletion_date: datetime,
+        retention_days: int,
+    ) -> bool:
+        """Notify a user their share data will be deleted N days after cancellation
+        (offer §13.3). Always sent — not gated by email preferences, same as the
+        other billing/security notices: this is a legal notice, not a nudge.
+        """
+        subject = "Your subscription was cancelled — data deletion scheduled"
+
+        html_body, text_body = self._render_template(
+            "billing-cancellation-deletion-scheduled",
+            {
+                "deletion_date": deletion_date.strftime("%Y-%m-%d"),
+                "retention_days": retention_days,
+                "recipient_email": to_email,
+            },
+            db=db,
+        )
+
+        if not text_body:
+            text_body = (
+                f"Your subscription was cancelled. Your shares will be permanently "
+                f"deleted on {deletion_date.strftime('%Y-%m-%d')} ({retention_days} days "
+                f"after cancellation) unless you resubscribe before then."
+            )
+
+        self.queue_email(
+            db,
+            to_email,
+            subject,
+            text_body,
+            html_body or text_body,
+            EMAIL_TYPE_BILLING_CANCELLATION_DELETION_SCHEDULED,
+        )
+        return True
+
+    async def send_billing_cancellation_deletion_executed(
+        self,
+        db: Session,
+        to_email: str,
+    ) -> bool:
+        """Confirm to a user that their share data has been deleted (offer §13.3)."""
+        subject = "Your data has been deleted"
+
+        html_body, text_body = self._render_template(
+            "billing-cancellation-deletion-executed",
+            {"recipient_email": to_email},
+            db=db,
+        )
+
+        if not text_body:
+            text_body = (
+                "The retention period after your subscription cancellation has ended "
+                "and your shares have now been permanently deleted."
+            )
+
+        self.queue_email(
+            db,
+            to_email,
+            subject,
+            text_body,
+            html_body or text_body,
+            EMAIL_TYPE_BILLING_CANCELLATION_DELETION_EXECUTED,
+        )
+        return True
+
+    async def send_billing_payment_failed(
+        self,
+        db: Session,
+        to_email: str,
+    ) -> bool:
+        """Warn a user that a subscription charge failed (offer §6.5)."""
+        subject = "Payment failed — please update your payment method"
+
+        html_body, text_body = self._render_template(
+            "billing-payment-failed",
+            {"recipient_email": to_email},
+            db=db,
+        )
+
+        if not text_body:
+            text_body = (
+                "The most recent charge for your subscription did not go through. "
+                "Please update your payment method to keep your subscription active."
+            )
+
+        self.queue_email(
+            db,
+            to_email,
+            subject,
+            text_body,
+            html_body or text_body,
+            EMAIL_TYPE_BILLING_PAYMENT_FAILED,
         )
         return True
 
