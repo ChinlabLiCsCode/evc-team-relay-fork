@@ -1114,6 +1114,110 @@ class TestBillingWebhook:
             for record in caplog.records
         )
 
+    def test_webhook_cancellation_schedules_deletion_when_flag_enabled(
+        self, client: TestClient, db_session
+    ):
+        from app.db.models import EmailQueue, LifecycleState, User
+
+        os.environ["BILLING_CANCELLATION_DATA_DELETION_ENABLED"] = "true"
+        get_settings.cache_clear()
+        try:
+            register_and_login(client, "cancel-deletion-user@example.com")
+            user = db_session.query(User).filter_by(email="cancel-deletion-user@example.com").one()
+
+            self._post_webhook(
+                client,
+                {"event": "subscription.cancelled", "data": {"user_id": str(user.id)}},
+            )
+
+            state = (
+                db_session.query(LifecycleState)
+                .filter_by(user_id=user.id, trigger_key="billing_cancellation_deletion")
+                .one()
+            )
+            assert state.state == "pending"
+            assert (
+                db_session.query(EmailQueue)
+                .filter_by(
+                    to_email=user.email, email_type="billing_cancellation_deletion_scheduled"
+                )
+                .count()
+                == 1
+            )
+        finally:
+            os.environ.pop("BILLING_CANCELLATION_DATA_DELETION_ENABLED", None)
+            get_settings.cache_clear()
+
+    def test_webhook_reactivation_after_cancellation_aborts_pending_deletion(
+        self, client: TestClient, db_session
+    ):
+        from app.db.models import LifecycleState, User
+
+        os.environ["BILLING_CANCELLATION_DATA_DELETION_ENABLED"] = "true"
+        get_settings.cache_clear()
+        try:
+            register_and_login(client, "resubscribe-user@example.com")
+            user = db_session.query(User).filter_by(email="resubscribe-user@example.com").one()
+
+            self._post_webhook(
+                client,
+                {"event": "subscription.cancelled", "data": {"user_id": str(user.id)}},
+            )
+            self._post_webhook(
+                client,
+                {"event": "subscription.activated", "data": {"user_id": str(user.id)}},
+            )
+
+            state = (
+                db_session.query(LifecycleState)
+                .filter_by(user_id=user.id, trigger_key="billing_cancellation_deletion")
+                .one()
+            )
+            assert state.state == "cancelled"
+        finally:
+            os.environ.pop("BILLING_CANCELLATION_DATA_DELETION_ENABLED", None)
+            get_settings.cache_clear()
+
+    def test_webhook_cancellation_without_flag_does_not_schedule_deletion(
+        self, client: TestClient, db_session
+    ):
+        """Default-off: a cancellation webhook must be a pure no-op for
+        deletion scheduling unless the flag is explicitly turned on."""
+        from app.db.models import LifecycleState, User
+
+        register_and_login(client, "no-flag-user@example.com")
+        user = db_session.query(User).filter_by(email="no-flag-user@example.com").one()
+
+        self._post_webhook(
+            client,
+            {"event": "subscription.cancelled", "data": {"user_id": str(user.id)}},
+        )
+
+        assert (
+            db_session.query(LifecycleState)
+            .filter_by(user_id=user.id, trigger_key="billing_cancellation_deletion")
+            .count()
+            == 0
+        )
+
+    def test_webhook_payment_failed_queues_warning_email(self, client: TestClient, db_session):
+        from app.db.models import EmailQueue, User
+
+        register_and_login(client, "payment-failed-user@example.com")
+        user = db_session.query(User).filter_by(email="payment-failed-user@example.com").one()
+
+        self._post_webhook(
+            client,
+            {"event": "subscription.payment_failed", "data": {"user_id": str(user.id)}},
+        )
+
+        assert (
+            db_session.query(EmailQueue)
+            .filter_by(to_email=user.email, email_type="billing_payment_failed")
+            .count()
+            == 1
+        )
+
     def test_no_secret_configured_rejects_all(self, client: TestClient):
         os.environ.pop("BILLING_WEBHOOK_SECRET", None)
         get_settings.cache_clear()

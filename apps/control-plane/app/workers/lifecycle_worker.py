@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.session import get_sessionmaker
+from app.services.billing_lifecycle_service import process_cancellation_deletions
 from app.services.lifecycle_service import (
     process_t1_no_share_24h,
     process_t2_inactive_after_share,
@@ -48,16 +49,32 @@ def _signal_handler(signum, frame) -> None:
 
 
 async def run_lifecycle_cycle() -> dict[str, int]:
-    """Run one detection cycle. Returns counts per trigger."""
+    """Run one detection cycle. Returns counts per trigger.
+
+    Billing-cancellation deletion (offer §13.3) runs on its own feature flag
+    (billing_cancellation_data_deletion_enabled) independent of the T1/T2
+    email-nudge engine's LIFECYCLE_ENABLED/LIFECYCLE_LAUNCH_DATE gates below —
+    those are about when nudge emails started, which has no bearing on when a
+    subscription cancels.
+    """
     settings = get_settings()
+    counts: dict[str, int] = {}
+
+    db = get_sessionmaker()()
+    try:
+        counts["billing_cancellation_deletion"] = await process_cancellation_deletions(db)
+    except Exception:
+        logger.exception("Error in billing-cancellation-deletion cycle")
+    finally:
+        db.close()
 
     if not settings.lifecycle_enabled:
         logger.debug("Lifecycle worker disabled (LIFECYCLE_ENABLED=false)")
-        return {}
+        return counts
 
     if not settings.lifecycle_launch_date:
-        logger.warning("LIFECYCLE_LAUNCH_DATE not set — skipping cycle")
-        return {}
+        logger.warning("LIFECYCLE_LAUNCH_DATE not set — skipping nudge cycle")
+        return counts
 
     try:
         launch_cutoff = datetime.fromisoformat(settings.lifecycle_launch_date)
@@ -65,20 +82,17 @@ async def run_lifecycle_cycle() -> dict[str, int]:
             launch_cutoff = launch_cutoff.replace(tzinfo=timezone.utc)
     except ValueError as e:
         logger.error("Invalid LIFECYCLE_LAUNCH_DATE %r: %s", settings.lifecycle_launch_date, e)
-        return {}
+        return counts
 
     db = get_sessionmaker()()
     try:
-        t1 = process_t1_no_share_24h(db, launch_cutoff)
-        t2 = process_t2_inactive_after_share(db, launch_cutoff)
-        logger.info(
-            "Lifecycle cycle complete",
-            extra={"t1_no_share_24h": t1, "t2_inactive_after_share": t2},
-        )
-        return {"t1_no_share_24h": t1, "t2_inactive_after_share": t2}
+        counts["t1_no_share_24h"] = process_t1_no_share_24h(db, launch_cutoff)
+        counts["t2_inactive_after_share"] = process_t2_inactive_after_share(db, launch_cutoff)
+        logger.info("Lifecycle cycle complete", extra=counts)
+        return counts
     except Exception:
         logger.exception("Error in lifecycle cycle")
-        return {}
+        return counts
     finally:
         db.close()
 

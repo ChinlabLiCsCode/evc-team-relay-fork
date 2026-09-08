@@ -1,0 +1,9 @@
+Data deleted
+
+As notified when your subscription on {{ server_name }} was cancelled, the
+retention period has ended and your shares have now been permanently deleted.
+
+If this is unexpected, please contact support.
+
+--
+{{ server_name }}
