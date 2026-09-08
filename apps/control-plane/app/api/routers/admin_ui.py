@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.api import deps
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.db import models
 from app.db.session import get_db
 from app.schemas import share as share_schema
@@ -128,7 +129,7 @@ def _issue_admin_session(request: Request, db: Session, user: models.User) -> Re
     auth_service.log_login(
         db,
         user,
-        request.client.host if request.client else None,
+        get_client_ip(request),
         request.headers.get("user-agent"),
     )
     response = RedirectResponse("/admin-ui/dashboard", status_code=302)
@@ -287,7 +288,7 @@ def login_2fa_submit(
             db=db,
             action=models.AuditAction.TOTP_BACKUP_USED,
             actor_user_id=user.id,
-            ip_address=request.client.host if request.client else None,
+            ip_address=get_client_ip(request),
             user_agent=request.headers.get("user-agent"),
         )
         db.commit()
@@ -307,7 +308,7 @@ def logout(
         auth_service.log_logout(
             db,
             user,
-            request.client.host if request.client else None,
+            get_client_ip(request),
             request.headers.get("user-agent"),
         )
     except Exception:

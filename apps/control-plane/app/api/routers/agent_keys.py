@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import func, select
@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.core import security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.db import models
 from app.db.session import get_db
 
@@ -77,6 +78,17 @@ _VALID_SCOPES = {"read", "write"}
 
 
 class AgentKeyCreateRequest(BaseModel):
+    # extra="forbid" (task 6f004379): pydantic's default is to silently DROP an
+    # unrecognised field rather than reject the request. On this model that is
+    # a scope-narrowing bypass, not a cosmetic typo — a caller who means to
+    # restrict a key (e.g. posts `"scope": "read"`, singular, instead of the
+    # actual field `scopes: list[str]`) gets a 201 with the untouched default
+    # of BOTH scopes instead of an error naming the field it got wrong.
+    # Reproduced live: POST {"name": "...", "scope": "read"} returned
+    # scopes=["read","write"]; POST {"scopes": ["read"]} (the real field)
+    # already worked. Forbidding extras turns the silent widen into a 422.
+    model_config = ConfigDict(extra="forbid")
+
     label: str | None = Field(default=None, min_length=1)
     expires_at: datetime | None = None
     # Default is read+write, not write-only (#b69d73fb, ADR-0001).
@@ -215,7 +227,7 @@ def create_agent_key(
             "expires_at": agent_key.expires_at.isoformat(),
             "default_ttl_applied": payload.expires_at is None,
             "scopes": agent_key.scopes,
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 
@@ -307,7 +319,7 @@ def revoke_agent_key(
                 "key_id": key_id,
                 "share_id": share_id,
                 "revoked_by": str(user_id),
-                "ip": request.client.host if request.client else None,
+                "ip": get_client_ip(request),
             },
         )
 
@@ -315,6 +327,11 @@ def revoke_agent_key(
 
 
 class AgentKeyScopesUpdateRequest(BaseModel):
+    # Same reasoning as AgentKeyCreateRequest.model_config above — this endpoint
+    # also sets the authorization surface, so a misnamed field must be a 422,
+    # not a silently-ignored no-op.
+    model_config = ConfigDict(extra="forbid")
+
     scopes: list[str]
 
     @field_validator("scopes")
@@ -382,7 +399,7 @@ def update_agent_key_scopes(
             "previous_scopes": previous,
             "new_scopes": agent_key.scopes,
             "updated_by": str(user_id),
-            "ip": request.client.host if request.client else None,
+            "ip": get_client_ip(request),
         },
     )
 

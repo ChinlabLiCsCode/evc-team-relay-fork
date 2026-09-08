@@ -14,33 +14,22 @@
 #
 # ## Honest scope — this is NOT a port of all of `.github/workflows/`
 #
-# It carries the control-plane half: Ruff lint + format, pytest, and the two
-# alembic guards — plus the hold gate. Deliberately absent, named rather than
-# implied, because a stub that looks like full CI is more dangerous than a gap
-# you can see:
-#
-#   * **typecheck-svelte / test-svelte** (`apps/web-publish`). Blocked, and not
-#     by effort. That app depends on `@entire-vc/tokens` and
-#     `@entire-vc/ui-svelte`, and `apps/web-publish/package-lock.json` pins
-#     their `resolved` URLs to `https://npm.pkg.github.com/download/...`.
-#     `npm ci` installs from `resolved`, so pointing `@entire-vc:registry` at
-#     the GitLab Package Registry (the fix that worked for evc-site) does NOT
-#     redirect these — the lockfile would have to be regenerated against the
-#     GitLab registry first, which is a change to the product, not to its CI.
-#     The alternative, a `GITHUB_TOKEN` CI variable, needs Maintainer to set;
-#     every agent account on this group is Developer(30), and
-#     `GET /projects/10/variables` answers 403 under this token — so this file
-#     cannot even establish whether such a variable already exists. Worth its
-#     own card either way.
+# It carries the control-plane checks (Ruff lint + format, pytest, the two
+# alembic guards), the web-publish checks (svelte-check, vitest), and the hold
+# gate. Deliberately absent, named rather than implied, because a stub that
+# looks like full CI is more dangerous than a gap you can see:
 #
 #   * **build-docker** — the two `push:false` image builds. Needs a
-#     docker-in-docker service on the one shared fleet runner, and web-publish's
-#     build hits the same npm blocker above. Not attempted here.
+#     docker-in-docker service on the one shared fleet runner. Not attempted
+#     here; the npm blocker that used to compound it is gone.
 #
-#   * **semgrep, trivy, release-drift, release, deploy** — untouched. Release
-#     and deploy in particular are not merely unported: releases still live on
-#     GitHub by fleet rule (§0z p.5) and production deploys are the manual SSH
-#     recipe in `docs/DEPLOY.md`, not a pipeline.
+#   * **semgrep, trivy, release-drift, release** — untouched. Releases still
+#     live on GitHub by fleet rule (§0z p.5).
+#
+#   * **deploy** — no longer untouched: `trigger:prod-team-relay` below bridges
+#     a successful push-to-main pipeline into `entire-vc/deploy`. The manual
+#     SSH recipe in `docs/DEPLOY.md` still works as a fallback, it's just no
+#     longer the only path.
 #
 # ## The half that is not in this file
 #
@@ -203,6 +192,52 @@ check-migration-drift:
   script:
     - uv run alembic upgrade head
     - uv run alembic check
+
+# ── web-publish (SvelteKit) ─────────────────────────────────────────────────
+# These two were absent from the first version of this file, and the header
+# said why: the lockfile pinned @entire-vc/tokens and @entire-vc/ui-svelte to
+# npm.pkg.github.com, and `npm ci` installs from `resolved`, so repointing the
+# registry alone did not redirect them.
+#
+# That was true and is now fixed at the source: both packages were ALREADY
+# published in the GitLab Package Registry of evc-brandkit (project 9) at
+# exactly the pinned versions — nothing had to be published, and no Maintainer
+# rights were needed. The lockfile's two entries were re-resolved against it.
+#
+# ⚠️ Auth is written to ~/.npmrc HERE rather than living in the repo's .npmrc
+# as a ${VAR} placeholder. That is deliberate: npm does not error on an
+# unexpanded ${VAR}, it takes the string literally and sends it as the token,
+# so a missing variable degrades into a confusing 401 instead of a clear
+# failure. CI_JOB_TOKEN is always populated by the runner, so no emptiness
+# check is needed — unlike the GITHUB_TOKEN this replaced.
+#
+# evc-brandkit has ci_job_token_scope_enabled=false, so no allowlist entry is
+# required for this project to read its packages.
+.web_publish_job: &web_publish_job
+  image: node:22-alpine
+  timeout: 20m
+  cache:
+    key:
+      files: [apps/web-publish/package-lock.json]
+    paths: [apps/web-publish/.npm/]
+  variables:
+    npm_config_cache: "$CI_PROJECT_DIR/apps/web-publish/.npm"
+  before_script:
+    - printf '//git.entire.host/api/v4/projects/9/packages/npm/:_authToken=%s\n' "$CI_JOB_TOKEN" > ~/.npmrc
+    - cd apps/web-publish
+    - npm ci
+
+typecheck-svelte:
+  <<: *web_publish_job
+  stage: lint
+  script:
+    - npm run check
+
+test-svelte:
+  <<: *web_publish_job
+  stage: test
+  script:
+    - npm test
 
 # ── deploy ──────────────────────────────────────────────────────────────────
 # Выкатка прод-контрол-плейна по мёржу в канон. До этой джобы её поднимал

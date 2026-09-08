@@ -233,7 +233,7 @@ def create_relay_token_cwt(
       WS-connect (auth.rs verify_token_with_channel) and on every subsequent message
       (y-sweet-core/src/doc_connection.rs DocConnection::send checks expiration_time
       and closes the socket with "Token expired" — not a connect-only check). This is
-      no longer a System3 unknown; it's our own code, covered by
+      no longer an upstream unknown; it's our own code, covered by
       crates/relay/tests/token_expiration_integration_test.rs.
     - share_id (-80203) is still NOT read or enforced by relay-server — confirmed by
       inspection of crates/y-sweet-core/src/cwt.rs parse_claims_map and
@@ -265,8 +265,7 @@ def create_relay_token_cwt(
         audience: Expected audience — MUST equal relay.toml's [server].url exactly
             (see Settings.effective_relay_audience). Required: relay-server rejects
             tokens with no aud claim (MissingAudience) once it knows to expect one.
-        issuer: Token issuer. Must be one of relay-server's VALID_ISSUERS allowlist
-            ("relay-server", "auth.system3.dev", "auth.system3.md" as of image 0.9.9) —
+        issuer: Token issuer. Must be one of relay-server's VALID_ISSUERS allowlist —
             see Settings.relay_token_issuer. Default is "relay-server", matching
             Settings.relay_token_issuer's own default (#7908e17e — the previous
             default here, "relay-control-plane", is NOT in the allowlist and was
@@ -297,7 +296,7 @@ def create_relay_token_cwt(
         claims[CWT_CLAIM_AUD] = audience
 
     # Bind token to the issuing share — confused-deputy mitigation (H6).
-    # Full enforcement requires relay-server (System3) to validate this claim.
+    # Full enforcement requires relay-server to validate this claim.
     if share_id:
         claims[CWT_CLAIM_SHARE] = share_id
 

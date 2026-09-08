@@ -117,7 +117,6 @@ apps/
     └── src/
 
 infra/                # Docker Compose stack
-forks/                # Vendored dependencies
 docs/                 # Documentation
 ```
 

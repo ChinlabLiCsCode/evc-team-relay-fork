@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api import deps
 from app.core import security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.core.metrics import LOGIN_ATTEMPTS_TOTAL
 from app.db import models
 from app.db.session import get_db
@@ -52,7 +53,7 @@ async def login(
     # Extract device/client information
     device_name = request.headers.get("x-device-name")
     user_agent = request.headers.get("user-agent")
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
 
     # First authenticate to check if 2FA is enabled
     try:
@@ -105,7 +106,7 @@ async def logout(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(deps.get_current_user),
 ) -> auth_schema.LogoutResponse:
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     # Log logout
@@ -169,7 +170,7 @@ def refresh_token(
         db=db,
         action=models.AuditAction.TOKEN_REFRESHED,
         actor_user_id=session.user_id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -267,7 +268,7 @@ def revoke_session(
         db=db,
         action=models.AuditAction.SESSION_REVOKED,
         actor_user_id=current_user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         details={"session_id": session_id},
     )
@@ -296,7 +297,7 @@ def revoke_all_sessions(
         db=db,
         action=models.AuditAction.SESSION_REVOKED,
         actor_user_id=current_user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         details={"revoked_count": revoked_count, "all_sessions": True},
     )
@@ -342,7 +343,7 @@ async def request_password_reset(
         audit_service.log_action(
             db=db,
             action=models.AuditAction.PASSWORD_RESET_REQUESTED,
-            ip_address=request.client.host if request.client else None,
+            ip_address=get_client_ip(request),
             user_agent=request.headers.get("user-agent"),
             details={"email": payload.email},
         )
@@ -434,7 +435,7 @@ async def confirm_password_reset_form(
             },
         )
 
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
     user_agent = request.headers.get("user-agent")
 
     if user:
@@ -533,7 +534,7 @@ async def request_email_verification(
         db=db,
         action=models.AuditAction.EMAIL_VERIFICATION_SENT,
         actor_user_id=current_user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -577,7 +578,7 @@ def verify_email(
         db=db,
         action=models.AuditAction.EMAIL_VERIFIED,
         actor_user_id=user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -710,7 +711,7 @@ def verify_2fa_setup(
         db=db,
         action=models.AuditAction.TOTP_ENABLED,
         actor_user_id=current_user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -752,7 +753,7 @@ def disable_2fa(
         db=db,
         action=models.AuditAction.TOTP_DISABLED,
         actor_user_id=current_user.id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         details={"used_backup_code": was_backup},
     )
@@ -806,14 +807,14 @@ async def login_with_2fa(
             db=db,
             action=models.AuditAction.TOTP_BACKUP_USED,
             actor_user_id=user.id,
-            ip_address=request.client.host if request.client else None,
+            ip_address=get_client_ip(request),
             user_agent=request.headers.get("user-agent"),
         )
 
     # Create session
     device_name = request.headers.get("x-device-name")
     user_agent = request.headers.get("user-agent")
-    ip_address = request.client.host if request.client else None
+    ip_address = get_client_ip(request)
 
     session, refresh_token = session_service.create_session(
         db=db,

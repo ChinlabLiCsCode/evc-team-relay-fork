@@ -92,10 +92,9 @@ class Settings(BaseSettings):
         description=(
             "'iss' claim on issued CWT tokens. relay-server (ghcr.io/entire-vc/"
             "evc-relay-server, crates/y-sweet-core/src/auth.rs VALID_ISSUERS) only accepts "
-            "'relay-server', 'auth.system3.dev', or 'auth.system3.md' as of image 0.9.9 — "
-            "the semantically accurate 'relay-control-plane' is NOT in that allowlist. Keep "
-            "the default until relay-server's allowlist is extended; do not hardcode "
-            "'relay-control-plane' in code."
+            "a short allowlist of issuer names. The default below is in it; the semantically "
+            "accurate 'relay-control-plane' is NOT. Keep the default until the allowlist is "
+            "extended; do not hardcode 'relay-control-plane' in code."
         ),
     )
 
@@ -220,6 +219,15 @@ class Settings(BaseSettings):
     )
     billing_base_url: str = Field(default="https://billing.entire.vc/api/v1")
     billing_service_token: str = Field(default="")
+    billing_service_id: str = Field(
+        default="relay",
+        description=(
+            "service_id this instance identifies as to the Billing Service. "
+            "The international deployment must keep the default 'relay' -- "
+            "only a self-hosted deployment with its own catalog (e.g. the RU "
+            "instance's 'relay-ru') overrides it."
+        ),
+    )
     billing_webhook_secret: str = Field(default="")
     billing_grace_period_days: int = Field(default=7)
     billing_return_url: str = Field(default="", description="Return URL after checkout")

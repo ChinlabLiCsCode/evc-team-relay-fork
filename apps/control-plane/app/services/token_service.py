@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core import security
 from app.core.config import get_settings
+from app.core.http import get_client_ip
 from app.core.metrics import RELAY_TOKENS_ISSUED_TOTAL
 from app.db import models
 from app.schemas import token as token_schema
@@ -157,7 +158,7 @@ def issue_relay_token(
         actor_user_id=user.id if user else None,
         target_share_id=share.id,
         details=details,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
 
