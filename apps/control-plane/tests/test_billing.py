@@ -713,6 +713,134 @@ class TestMemberLimitEnforcementViaRoute:
         assert resp.json()["limit"] == "max_members_per_share"
 
 
+class TestInviteRedeemMemberLimitEnforcementViaRoute:
+    """Companion to TestMemberLimitEnforcementViaRoute (#7703d4fe): the
+    owner/admin-driven POST /shares/{id}/members route has always enforced
+    max_members_per_share. Invite-link redemption -- by far the more common
+    way a member actually joins a share -- added the ShareMember row
+    unconditionally, with no check at all."""
+
+    def test_invite_redeem_beyond_max_members_per_share_rejected(self, client: TestClient):
+        owner_token = register_and_login(client, "invite-limit-owner@example.com")
+        share_resp = client.post(
+            "/shares",
+            json={"kind": "doc", "path": "invite-limit.md"},
+            headers=auth_headers(owner_token),
+        )
+        assert share_resp.status_code == 201, share_resp.text
+        share_id = share_resp.json()["id"]
+
+        # Free plan caps max_members_per_share at 3 -- fill it via invite
+        # redemption (not the direct add_member route this time).
+        for i in range(3):
+            invite_resp = client.post(
+                f"/shares/{share_id}/invites",
+                json={"role": "viewer"},
+                headers=auth_headers(owner_token),
+            )
+            assert invite_resp.status_code == 201, invite_resp.text
+            redeem_resp = client.post(
+                f"/invite/{invite_resp.json()['token']}/redeem",
+                json={
+                    "email": f"invite-limit-member-{i}@example.com",
+                    "password": "test-pass-123",
+                },
+            )
+            assert redeem_resp.status_code == 200, redeem_resp.text
+
+        # 4th member via a fresh invite must be rejected, same shape of error
+        # the direct add_member route already returns.
+        invite_resp = client.post(
+            f"/shares/{share_id}/invites",
+            json={"role": "viewer"},
+            headers=auth_headers(owner_token),
+        )
+        redeem_resp = client.post(
+            f"/invite/{invite_resp.json()['token']}/redeem",
+            json={"email": "invite-limit-member-extra@example.com", "password": "test-pass-123"},
+        )
+        assert redeem_resp.status_code == 403, redeem_resp.text
+        assert redeem_resp.json()["limit"] == "max_members_per_share"
+
+        # And the share really does still only have 3 members -- the rejected
+        # 4th redemption must not have partially applied.
+        members_resp = client.get(f"/shares/{share_id}/members", headers=auth_headers(owner_token))
+        assert len(members_resp.json()) == 3
+
+    def test_invite_redeem_idempotent_reredemption_not_blocked_at_cap(self, client: TestClient):
+        """A member re-redeeming an invite they already used must stay
+        idempotent even once the share is at its cap -- the limit check must
+        fire only for an ACTUAL new member, not merely because the share is
+        full of members who already exist."""
+        owner_token = register_and_login(client, "invite-limit-idem-owner@example.com")
+        share_resp = client.post(
+            "/shares",
+            json={"kind": "doc", "path": "invite-limit-idem.md"},
+            headers=auth_headers(owner_token),
+        )
+        share_id = share_resp.json()["id"]
+
+        first_token = None
+        for i in range(3):
+            invite_resp = client.post(
+                f"/shares/{share_id}/invites",
+                json={"role": "viewer"},
+                headers=auth_headers(owner_token),
+            )
+            invite_token = invite_resp.json()["token"]
+            if i == 0:
+                first_token = invite_token
+            redeem_resp = client.post(
+                f"/invite/{invite_token}/redeem",
+                json={
+                    "email": f"invite-limit-idem-member-{i}@example.com",
+                    "password": "test-pass-123",
+                },
+            )
+            assert redeem_resp.status_code == 200, redeem_resp.text
+
+        # Share is now at its cap (3/3). The first member re-authenticates and
+        # re-redeems their OWN invite token -- must still succeed.
+        member_token = login(client, "invite-limit-idem-member-0@example.com", "test-pass-123")
+        redeem_again_resp = client.post(
+            f"/invite/{first_token}/redeem",
+            headers=auth_headers(member_token),
+        )
+        assert redeem_again_resp.status_code == 200, redeem_again_resp.text
+
+    def test_invite_redeem_quota_not_enforced_when_billing_disabled(self, client: TestClient):
+        os.environ["BILLING_ENABLED"] = "false"
+        get_settings.cache_clear()
+        try:
+            owner_token = register_and_login(client, "invite-limit-off-owner@example.com")
+            share_resp = client.post(
+                "/shares",
+                json={"kind": "doc", "path": "invite-limit-off.md"},
+                headers=auth_headers(owner_token),
+            )
+            share_id = share_resp.json()["id"]
+
+            # Free plan caps max_members_per_share at 3 -- billing off must
+            # allow a 4th via invite redemption too.
+            for i in range(4):
+                invite_resp = client.post(
+                    f"/shares/{share_id}/invites",
+                    json={"role": "viewer"},
+                    headers=auth_headers(owner_token),
+                )
+                redeem_resp = client.post(
+                    f"/invite/{invite_resp.json()['token']}/redeem",
+                    json={
+                        "email": f"invite-limit-off-member-{i}@example.com",
+                        "password": "test-pass-123",
+                    },
+                )
+                assert redeem_resp.status_code == 200, redeem_resp.text
+        finally:
+            os.environ["BILLING_ENABLED"] = "true"
+            get_settings.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Billing disabled -> every /billing/* endpoint 404s (feature-flagged off)
 # ---------------------------------------------------------------------------
