@@ -65,6 +65,7 @@ DOMAIN_BASE=entire.vc
 WEB_PUBLISH_DOMAIN=publish.entire.vc
 RELAY_PUBLIC_URL=wss://relay.entire.vc
 BILLING_ENABLED=true
+BILLING_STUB_MODE=false
 EOF
 unset SMOKE_URL
 url="$(resolve_smoke_url "$tmpdir/evc-live-shape")"
@@ -176,9 +177,43 @@ assert_eq "missing .env entirely -> defaults to False, no error" "False" "$expec
 mkdir -p "$tmpdir/billing-case"
 cat > "$tmpdir/billing-case/.env" <<'EOF'
 BILLING_ENABLED=TRUE
+BILLING_STUB_MODE=FALSE
 EOF
 expected="$(resolve_expected_billing "$tmpdir/billing-case")"
-assert_eq "BILLING_ENABLED=TRUE (uppercase) normalizes to True" "True" "$expected"
+assert_eq "BILLING_ENABLED=TRUE + BILLING_STUB_MODE=FALSE (uppercase) normalizes to True" "True" "$expected"
+
+# ============================================================================
+# resolve_expected_billing() — stub-mode dimension (Mesh #fa109ff5)
+#
+# /server/info now reports billing_enabled = BILLING_ENABLED AND NOT
+# BILLING_STUB_MODE (app/api/routers/server.py). This function must compute
+# the identical formula, or the smoke gate compares against the wrong
+# expectation and either false-fails a correctly-configured host or
+# false-passes the exact silent-stub defect this gate exists to catch.
+# ============================================================================
+
+# --- RED CONTROL reproducing the actual incident: BILLING_ENABLED=true AND
+# BILLING_STUB_MODE=true (tr-ru-vm's state before the fix) must expect False —
+# a hardcoded "just check BILLING_ENABLED" would have expected True here and
+# the gate would have passed a stubbed catalog as if it were the real one. ---
+mkdir -p "$tmpdir/stub-trap"
+cat > "$tmpdir/stub-trap/.env" <<'EOF'
+BILLING_ENABLED=true
+BILLING_STUB_MODE=true
+EOF
+expected="$(resolve_expected_billing "$tmpdir/stub-trap")"
+assert_eq "BILLING_ENABLED=true + BILLING_STUB_MODE=true (the actual #fa109ff5 incident shape) expects False" "False" "$expected"
+
+# --- Missing BILLING_STUB_MODE key entirely -> defaults to True (stub),
+# mirroring Settings.billing_stub_mode's own default=True. A host that sets
+# BILLING_ENABLED=true and never touches BILLING_STUB_MODE is NOT selling —
+# the running app itself would compute billing_enabled=false in this shape. --
+mkdir -p "$tmpdir/stub-key-absent"
+cat > "$tmpdir/stub-key-absent/.env" <<'EOF'
+BILLING_ENABLED=true
+EOF
+expected="$(resolve_expected_billing "$tmpdir/stub-key-absent")"
+assert_eq "BILLING_ENABLED=true, BILLING_STUB_MODE absent -> defaults to stub=true -> expects False" "False" "$expected"
 
 if [ "$fail" -ne 0 ]; then
   echo "--- one or more checks FAILED ---" >&2

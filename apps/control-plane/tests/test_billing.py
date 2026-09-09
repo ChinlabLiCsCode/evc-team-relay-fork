@@ -845,6 +845,35 @@ class TestBillingPlansEndpoint:
         assert resp.status_code == 200
         assert len(resp.json()["plans"]) == 2
 
+    def test_get_billing_plans_502s_on_billing_service_error(self, client: TestClient):
+        """Mesh #fa109ff5: a real (non-stub) Billing Service failure must
+        surface as an error to the caller, not a silently-substituted stub
+        catalog that looks like a healthy 200 response."""
+        from app.clients.billing_client import BillingServiceError
+
+        os.environ["BILLING_STUB_MODE"] = "false"
+        os.environ["BILLING_SERVICE_TOKEN"] = "test-service-token"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        try:
+            with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+                mock_client = AsyncMock()
+                mock_client.get_products.side_effect = BillingServiceError(
+                    code="UPSTREAM_DOWN", message="unavailable", status=502
+                )
+                mock_get_client.return_value = mock_client
+
+                resp = client.get("/v1/billing/plans")
+                assert resp.status_code == 502
+                # app.middleware.errors.http_exception_handler wraps HTTPException.detail
+                # into {"error": {"message": ...}}, not a bare "detail" key.
+                assert resp.json()["error"]["message"] == "Billing Service temporarily unavailable"
+        finally:
+            os.environ["BILLING_STUB_MODE"] = "true"
+            os.environ.pop("BILLING_SERVICE_TOKEN", None)
+            get_settings.cache_clear()
+            billing_service._billing_client = None
+
 
 class TestCheckoutEndpoint:
     def test_checkout_stub_mode_returns_not_available(self, client: TestClient):
@@ -1423,10 +1452,28 @@ class TestFindUserByBillingIdentityAmbiguousProviderUserId:
 
 class TestServerInfoBilling:
     def test_billing_enabled_true_when_configured(self, client: TestClient):
+        """Genuine positive control: billing_enabled=true requires BOTH
+        BILLING_ENABLED=true AND BILLING_STUB_MODE=false (Mesh #fa109ff5) --
+        the file's ambient default is BILLING_STUB_MODE=true, so this test
+        must explicitly turn stub mode off to represent real billing."""
+        os.environ["BILLING_STUB_MODE"] = "false"
+        get_settings.cache_clear()
+        try:
+            resp = client.get("/server/info")
+            assert resp.status_code == 200
+            assert resp.json()["edition"] == "enterprise"
+            assert resp.json()["features"]["billing_enabled"] is True
+        finally:
+            os.environ["BILLING_STUB_MODE"] = "true"
+            get_settings.cache_clear()
+
+    def test_billing_enabled_false_when_stub_mode_on(self, client: TestClient):
+        """Mesh #fa109ff5: the actual incident shape -- BILLING_ENABLED=true
+        (file default) with BILLING_STUB_MODE=true (also file default) must
+        report billing_enabled=false. A stub catalog is not real billing."""
         resp = client.get("/server/info")
         assert resp.status_code == 200
-        assert resp.json()["edition"] == "enterprise"
-        assert resp.json()["features"]["billing_enabled"] is True
+        assert resp.json()["features"]["billing_enabled"] is False
 
     def test_billing_enabled_false_by_default(self, client: TestClient):
         os.environ["BILLING_ENABLED"] = "false"
@@ -1498,6 +1545,38 @@ class TestNonStubModeMocksExternalBillingClient:
             data = await billing_service.get_entitlements_cached("cid-nonstub-fallback")
             # Billing Service failed -> falls back to stub entitlements, does not raise.
             assert data["plan"] in ("Relay Free", "Unknown")
+
+    @pytest.mark.asyncio
+    async def test_get_available_plans_raises_on_billing_service_error(self):
+        """Mesh #fa109ff5: get_available_plans() must NOT silently substitute
+        the dev stub catalog when a real (non-stub) Billing Service call
+        fails -- that reads to the caller as a healthy catalog response, not
+        an error, and is indistinguishable from success (the exact incident:
+        an instance that could not reach Billing showed the international
+        USD catalog with zero errors). BillingServiceError must propagate;
+        the /v1/billing/plans router maps it to a 502 (see
+        TestBillingPlansEndpoint.test_get_billing_plans_502s_on_billing_service_error).
+        """
+        from app.clients.billing_client import BillingServiceError
+
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_products.side_effect = BillingServiceError(
+                code="UPSTREAM_DOWN", message="unavailable", status=502
+            )
+            mock_get_client.return_value = mock_client
+
+            with pytest.raises(BillingServiceError):
+                await billing_service.get_available_plans()
+
+    @pytest.mark.asyncio
+    async def test_get_available_plans_still_stubs_in_stub_mode(self):
+        """Regression guard: stub mode itself is untouched -- only the
+        except-branch silent-fallback-on-real-failure was removed."""
+        os.environ["BILLING_STUB_MODE"] = "true"
+        get_settings.cache_clear()
+        plans = await billing_service.get_available_plans()
+        assert len(plans) == 2  # stub catalog, unaffected by this change
 
     @pytest.mark.asyncio
     async def test_create_checkout_session_calls_billing_client(self):
