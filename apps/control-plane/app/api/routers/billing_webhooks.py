@@ -14,7 +14,8 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db import models
 from app.db.session import get_db
-from app.services import audit_service, billing_service
+from app.services import audit_service, billing_lifecycle_service, billing_service
+from app.services.email_service import get_email_service
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,16 @@ _EVENT_TO_AUDIT: dict[str, models.AuditAction | None] = {
     "subscription.activated": models.AuditAction.BILLING_SUBSCRIPTION_ACTIVATED,
     "subscription.payment_failed": models.AuditAction.BILLING_PAYMENT_FAILED,
     "payment.succeeded": None,  # Acknowledge without audit log
+}
+
+# Offer §13.3: events that mean "no longer paying" -> (re-)arm the deletion
+# countdown. Events that mean "paying again" -> abort a pending one.
+_CANCELLATION_EVENTS = {"subscription.cancelled", "subscription.expired"}
+_REACTIVATION_EVENTS = {
+    "subscription.created",
+    "subscription.activated",
+    "subscription.renewed",
+    "subscription.updated",
 }
 
 
@@ -123,26 +134,37 @@ async def billing_webhook(
     if user_id:
         billing_service.invalidate_cache(user_id)
 
-    # Store subscription_id on user if provided. user_id here is whatever
+    # Resolve the local user once. user_id here is whatever
     # billing_service.get_billing_identity() sent when the subscription was
     # created — casdoor_id, an OAuth provider_user_id, or (rarely) the
     # internal user.id — so the lookup must try all three forms, the same
     # way find_user_by_billing_identity() does, not just casdoor_id (which
     # no code path ever writes — see get_billing_identity()'s docstring).
-    if user_id and subscription_id:
-        user = billing_service.find_user_by_billing_identity(db, user_id)
-        if user:
-            user.billing_subscription_id = subscription_id
-            db.commit()
-        else:
-            logger.warning(
-                "Billing webhook: no user found for billing identity, subscription_id not stored",
-                extra={
-                    "event_id": event_id,
-                    "user_id": user_id,
-                    "subscription_id": subscription_id,
-                },
-            )
+    user = billing_service.find_user_by_billing_identity(db, user_id) if user_id else None
+    if user_id and not user:
+        logger.warning(
+            "Billing webhook: no user found for billing identity",
+            extra={"event_id": event_id, "user_id": user_id, "event_type": event_type},
+        )
+
+    # Store subscription_id on user if provided.
+    if user and subscription_id:
+        user.billing_subscription_id = subscription_id
+        db.commit()
+
+    # Offer §13.3: (re-)arm or abort the post-cancellation data-deletion
+    # countdown. No-op unless billing_cancellation_data_deletion_enabled.
+    if user and event_type in _CANCELLATION_EVENTS:
+        await billing_lifecycle_service.schedule_cancellation_deletion(db, user)
+    elif user and event_type in _REACTIVATION_EVENTS:
+        await billing_lifecycle_service.cancel_scheduled_deletion(db, user)
+
+    # Offer §6.5: warn the user a charge failed. Only actually fires today
+    # for the Hyperswitch gateway — Stripe/CloudPayments don't dispatch this
+    # event at all yet, but the handler is gateway-agnostic so it starts
+    # working the moment they do too.
+    if user and event_type == "subscription.payment_failed":
+        await get_email_service().send_billing_payment_failed(db, user.email)
 
     # Create audit log entry
     audit_action = _EVENT_TO_AUDIT.get(event_type)

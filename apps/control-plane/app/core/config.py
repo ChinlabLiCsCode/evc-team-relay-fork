@@ -231,6 +231,16 @@ class Settings(BaseSettings):
     billing_webhook_secret: str = Field(default="")
     billing_grace_period_days: int = Field(default=7)
     billing_return_url: str = Field(default="", description="Return URL after checkout")
+    # Offer §13.3: delete a user's share data N days after their subscription
+    # cancels/expires, unless they resubscribe first. Off by default — this
+    # is an irreversible destructive action on user data and must be turned
+    # on deliberately per deployment after review, not inherited from
+    # billing_enabled.
+    billing_cancellation_data_deletion_enabled: bool = Field(
+        default=False,
+        description="Delete cancelled users' share data after the retention window (offer §13.3)",
+    )
+    billing_cancellation_data_deletion_days: int = Field(default=30)
 
     # Web publishing settings
     web_publish_domain: str | None = Field(
