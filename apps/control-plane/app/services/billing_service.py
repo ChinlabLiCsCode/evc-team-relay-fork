@@ -28,6 +28,12 @@ logger = get_logger(__name__)
 _entitlements_cache: dict[str, tuple[dict[str, Any], float]] = {}
 _CACHE_TTL_SECONDS = 300  # 5 minutes
 
+# In-memory cache of the resolved free-tier product entitlements per
+# service_id: {service_id: (entitlements | None, timestamp)}. See
+# _get_catalog_free_entitlements() below.
+_free_product_cache: dict[str, tuple[dict[str, Any] | None, float]] = {}
+_FREE_PRODUCT_CACHE_TTL_SECONDS = 300  # 5 minutes, matches _CACHE_TTL_SECONDS
+
 # Singleton billing client (lazy init)
 _billing_client: BillingClient | None = None
 
@@ -227,6 +233,71 @@ def get_casdoor_id(db: Session, user: models.User) -> str:
     return str(user.id)
 
 
+async def _get_catalog_free_entitlements() -> dict[str, Any] | None:
+    """Resolve the CURRENT service_id's free-tier product entitlements from
+    the live billing catalog (GET /products), cached for 5 minutes.
+
+    Each service_id has its own free product with its own currency/limits --
+    e.g. prod_relay_free (USD, max_shares=3) vs prod_relay_ru_free (RUB,
+    max_shares=1, max_members_per_share=5) -- so this must never be answered
+    from a hardcoded constant. That is exactly what the STUB_PLANS-based
+    fallback used to do everywhere it was called, and why RU users were
+    about to silently inherit USD-market limits the moment their control-
+    plane instance pointed at real billing (Mesh #963f0870). The billing
+    client is a per-process singleton constructed with settings.
+    billing_service_id, so get_products() is already scoped correctly --
+    there's no cross-service_id mixing risk here.
+
+    The "free" product is identified as the one carrying a zero-amount
+    price -- Billing Service's Product model has no separate tier/kind
+    field, price is the only reliable marker (see evc-billing
+    services/billing/app/models/billing.py and its seed migrations, which
+    give every free product exactly one price row with amount=0).
+
+    Returns None if the catalog has no zero-price product for this
+    service_id, or if the catalog itself couldn't be fetched. Callers MUST
+    treat None as "billing catalog is unavailable -- fall back to
+    STUB_PLANS as an emergency default", which is a different condition
+    from "user has no subscription" (that case is exactly what this
+    function resolves correctly).
+    """
+    settings = get_settings()
+    service_id = settings.billing_service_id
+    now = time.monotonic()
+
+    cached = _free_product_cache.get(service_id)
+    if cached and now - cached[1] < _FREE_PRODUCT_CACHE_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        client = _get_billing_client()
+        result = await client.get_products()
+    except BillingServiceError:
+        logger.exception(
+            "Billing catalog unreachable while resolving free-tier entitlements "
+            "for service_id=%s -- emergency STUB_PLANS fallback will be used",
+            service_id,
+        )
+        return None
+
+    free_entitlements: dict[str, Any] | None = None
+    for product in result.get("products", []):
+        prices = product.get("prices") or []
+        if any(price.get("amount") == 0 for price in prices):
+            free_entitlements = product.get("entitlements", {})
+            break
+
+    if free_entitlements is None:
+        logger.warning(
+            "No zero-price product found in billing catalog for service_id=%s "
+            "-- emergency STUB_PLANS fallback will be used",
+            service_id,
+        )
+
+    _free_product_cache[service_id] = (free_entitlements, now)
+    return free_entitlements
+
+
 async def get_entitlements_cached(casdoor_id: str) -> dict[str, Any]:
     """Get user entitlements with 5-minute TTL cache.
 
@@ -258,13 +329,21 @@ async def get_entitlements_cached(casdoor_id: str) -> dict[str, Any]:
             # Last resort: return stub entitlements
             data = await get_stub_entitlements(casdoor_id)
 
-    # Free tier fallback: billing returns empty entitlements for users without subscription.
-    # Apply local free-tier defaults so limits are enforced.
+    # Free tier fallback: billing returns empty entitlements for users without
+    # subscription -- this is the normal state for the vast majority of users
+    # (exactly one active Relay subscription exists in prod as of this
+    # writing). Resolve the REAL free-tier product from the billing catalog
+    # for our service_id; STUB_PLANS is reserved for the separate case where
+    # the catalog fetch itself fails (see _get_catalog_free_entitlements).
     if not data.get("entitlements") and data.get("plan") in ("free", "Free", None):
-        from app.services.billing_stub import STUB_PLANS
+        catalog_free = await _get_catalog_free_entitlements()
+        if catalog_free is not None:
+            data["entitlements"] = catalog_free
+        else:
+            from app.services.billing_stub import STUB_PLANS
 
-        free_ent = STUB_PLANS["free"]["entitlements"]
-        data["entitlements"] = {k: _format_entitlement_value(v) for k, v in free_ent.items()}
+            free_ent = STUB_PLANS["free"]["entitlements"]
+            data["entitlements"] = {k: _format_entitlement_value(v) for k, v in free_ent.items()}
 
     # Update cache
     _entitlements_cache[casdoor_id] = (data, now)
@@ -336,13 +415,20 @@ async def check_limit(casdoor_id: str, entitlement_key: str, current_count: int)
         and subscription.get("status") in ("cancelled", "expired")
         and not is_in_grace_period(subscription)
     ):
-        # Grace period expired, use Free plan limits
+        # Grace period expired, use Free plan limits -- resolved from the
+        # billing catalog for our service_id (see
+        # _get_catalog_free_entitlements), not a hardcoded constant.
+        # STUB_PLANS is only the emergency fallback if the catalog itself
+        # is unreachable.
         settings = get_settings()
         if not settings.billing_stub_mode:
-            from app.services.billing_stub import STUB_PLANS
+            catalog_free = await _get_catalog_free_entitlements()
+            if catalog_free is not None:
+                entitlements = catalog_free
+            else:
+                from app.services.billing_stub import STUB_PLANS
 
-            free_entitlements = STUB_PLANS["free"]["entitlements"]
-            entitlements = free_entitlements
+                entitlements = STUB_PLANS["free"]["entitlements"]
             plan_name = "Free (expired)"
 
     max_value = _get_limit(entitlements, entitlement_key)
@@ -386,9 +472,13 @@ async def check_visibility(casdoor_id: str, visibility: str) -> None:
     ):
         settings = get_settings()
         if not settings.billing_stub_mode:
-            from app.services.billing_stub import STUB_PLANS
+            catalog_free = await _get_catalog_free_entitlements()
+            if catalog_free is not None:
+                entitlements = catalog_free
+            else:
+                from app.services.billing_stub import STUB_PLANS
 
-            entitlements = STUB_PLANS["free"]["entitlements"]
+                entitlements = STUB_PLANS["free"]["entitlements"]
             plan_name = "Free (expired)"
 
     allowed = _get_allowed_list(entitlements, "allowed_web_visibility")
