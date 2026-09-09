@@ -158,7 +158,7 @@ async def redeem_invite(
     invite = invite_service.get_invite_by_token(db, token)
     old_use_count = invite.use_count if invite else 0
 
-    result = invite_service.redeem_invite(
+    result = await invite_service.redeem_invite(
         db=db,
         token=token,
         user=current_user,
@@ -242,7 +242,7 @@ def invite_page(
 
 @public_router.post("/{token}/accept", response_class=HTMLResponse)
 @limiter.limit("10/minute")
-def accept_invite(
+async def accept_invite(
     request: Request,
     token: str,
     action: Annotated[str | None, Form()] = None,
@@ -279,7 +279,7 @@ def accept_invite(
                 password=password,
             )
 
-            result = invite_service.redeem_invite(
+            result = await invite_service.redeem_invite(
                 db=db,
                 token=token,
                 user=None,
@@ -334,7 +334,7 @@ def accept_invite(
             )
 
             # Redeem invite
-            result = invite_service.redeem_invite(
+            result = await invite_service.redeem_invite(
                 db=db,
                 token=token,
                 user=user,
@@ -372,7 +372,7 @@ def accept_invite(
                     status_code=302,
                 )
 
-            result = invite_service.redeem_invite(
+            result = await invite_service.redeem_invite(
                 db=db,
                 token=token,
                 user=current_user,
