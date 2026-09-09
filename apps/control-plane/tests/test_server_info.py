@@ -92,3 +92,59 @@ def test_server_info_oauth_provider_hidden_when_disabled(client):
         features = data["features"]
         assert features["oauth_enabled"] is False
         assert features["oauth_provider"] is None
+
+
+# ---------------------------------------------------------------------------
+# billing_enabled AND NOT billing_stub_mode (Mesh #fa109ff5)
+#
+# A stubbed catalog is not real billing. Reporting billing_enabled=true for an
+# instance that's actually serving BILLING_STUB_MODE=true is exactly what let
+# tr-ru-vm run for days indistinguishable from a genuinely billing-enabled
+# instance from the outside -- including to scripts/deploy.sh's own smoke gate,
+# which reads this exact field to decide whether to auto-rollback.
+# ---------------------------------------------------------------------------
+
+
+def test_server_info_billing_enabled_false_when_stub_mode_on(client):
+    """The actual incident shape: BILLING_ENABLED=true + BILLING_STUB_MODE=true
+    (defaulted, in tr-ru-vm's case) must externally report billing_enabled=false,
+    not true -- a stub catalog is not real billing."""
+    mock_settings = Settings(
+        billing_enabled=True,
+        billing_stub_mode=True,
+        relay_public_url="wss://relay.test",
+    )
+
+    with patch("app.api.routers.server.get_settings", return_value=mock_settings):
+        response = client.get("/server/info")
+        assert response.status_code == 200
+        assert response.json()["features"]["billing_enabled"] is False
+
+
+def test_server_info_billing_enabled_true_only_when_both_conditions_hold(client):
+    """Positive control: billing_enabled=true requires BOTH billing_enabled=True
+    AND billing_stub_mode=False -- the genuinely-live shape (tr-relay-vm today)."""
+    mock_settings = Settings(
+        billing_enabled=True,
+        billing_stub_mode=False,
+        relay_public_url="wss://relay.test",
+    )
+
+    with patch("app.api.routers.server.get_settings", return_value=mock_settings):
+        response = client.get("/server/info")
+        assert response.status_code == 200
+        assert response.json()["features"]["billing_enabled"] is True
+
+
+def test_server_info_billing_enabled_false_when_billing_itself_off(client):
+    """Stub mode being off doesn't matter if billing_enabled is False outright."""
+    mock_settings = Settings(
+        billing_enabled=False,
+        billing_stub_mode=False,
+        relay_public_url="wss://relay.test",
+    )
+
+    with patch("app.api.routers.server.get_settings", return_value=mock_settings):
+        response = client.get("/server/info")
+        assert response.status_code == 200
+        assert response.json()["features"]["billing_enabled"] is False

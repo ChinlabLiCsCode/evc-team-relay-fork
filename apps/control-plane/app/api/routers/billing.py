@@ -63,7 +63,17 @@ async def get_billing_plans():
             detail="Billing is not enabled",
         )
 
-    plans = await billing_service.get_available_plans()
+    try:
+        plans = await billing_service.get_available_plans()
+    except BillingServiceError as e:
+        if 400 <= e.status < 500:
+            logger.warning("Billing client error in get_billing_plans: %s", e)
+            raise HTTPException(status_code=e.status, detail=e.message) from e
+        logger.exception("Billing service error in get_billing_plans")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Billing Service temporarily unavailable",
+        ) from e
     return {"plans": plans}
 
 

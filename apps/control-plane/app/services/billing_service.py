@@ -477,18 +477,22 @@ async def get_billing_plan(
 
 
 async def get_available_plans() -> list[dict[str, Any]]:
-    """Get available plans for upgrade UI."""
+    """Get available plans for upgrade UI.
+
+    Stub catalog is served ONLY when billing_stub_mode is explicitly on. A real
+    Billing Service failure must not be masked by silently substituting the dev
+    stub — that reads to the caller as a healthy catalog response, not an error
+    (Mesh #fa109ff5: a stubbed-mode-off instance that can't reach Billing showed
+    the international USD catalog with zero errors, indistinguishable from success).
+    Let BillingServiceError propagate; the router maps it to a 502.
+    """
     settings = get_settings()
     if settings.billing_stub_mode:
         return await get_stub_plans()
 
-    try:
-        client = _get_billing_client()
-        result = await client.get_products()
-        return result.get("products", [])
-    except BillingServiceError:
-        logger.exception("Failed to fetch plans from Billing Service")
-        return await get_stub_plans()
+    client = _get_billing_client()
+    result = await client.get_products()
+    return result.get("products", [])
 
 
 async def create_checkout_session(
