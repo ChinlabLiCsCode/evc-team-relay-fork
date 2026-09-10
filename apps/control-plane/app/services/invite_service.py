@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.db import models
 from app.schemas import invite as invite_schema
 from app.schemas import user as user_schema
-from app.services import audit_service, share_service, user_service
+from app.services import audit_service, billing_service, share_service, usage_service, user_service
 
 
 def generate_secure_token() -> str:
@@ -238,7 +238,7 @@ def get_invite_public_info(db: Session, token: str) -> invite_schema.InvitePubli
     )
 
 
-def redeem_invite(
+async def redeem_invite(
     db: Session,
     token: str,
     user: models.User | None = None,
@@ -334,6 +334,21 @@ def redeem_invite(
     ).scalar_one_or_none()
 
     if not existing_member:
+        # #7703d4fe: the owner/admin-driven POST /shares/{id}/members route
+        # (shares.py add_member) has always enforced max_members_per_share —
+        # this is the far more common path (invite-link redemption) and it
+        # added the ShareMember row unconditionally, letting a share's
+        # member count run past its plan's cap with no rejection at all.
+        settings = get_settings()
+        if settings.billing_enabled:
+            owner = invite.share.owner
+            casdoor_id = billing_service.get_casdoor_id(db, owner)
+            await billing_service.check_limit(
+                casdoor_id,
+                "max_members_per_share",
+                usage_service.count_share_members(db, invite.share_id),
+            )
+
         # Add user as member with atomic use count increment
         member = models.ShareMember(
             share_id=invite.share_id,

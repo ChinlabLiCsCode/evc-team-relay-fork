@@ -73,7 +73,10 @@ def get_server_info(db: Session = Depends(get_db)) -> ServerInfo:
         features=ServerFeatures(
             oauth_enabled=settings.oauth_enabled,
             oauth_provider=settings.oauth_provider_name if settings.oauth_enabled else None,
-            billing_enabled=settings.billing_enabled,
+            # A stubbed catalog is not real billing — don't report billing_enabled=true
+            # for it externally (Mesh #fa109ff5: this is what the deploy smoke gate reads
+            # to decide whether an instance is genuinely selling, so it must not lie).
+            billing_enabled=settings.billing_enabled and not settings.billing_stub_mode,
             web_publish_enabled=settings.web_publish_enabled,
             web_publish_domain=settings.web_publish_domain,
         ),

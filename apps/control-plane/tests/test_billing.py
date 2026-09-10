@@ -60,11 +60,13 @@ def _billing_enabled_stub_mode():
     os.environ["BILLING_STUB_MODE"] = "true"
     get_settings.cache_clear()
     billing_service._entitlements_cache.clear()
+    billing_service._free_product_cache.clear()
     yield
     for key in ("BILLING_ENABLED", "BILLING_STUB_MODE", "BILLING_SERVICE_TOKEN"):
         os.environ.pop(key, None)
     get_settings.cache_clear()
     billing_service._entitlements_cache.clear()
+    billing_service._free_product_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +222,32 @@ class TestCheckLimitGracePeriodFallback:
     subscriptions only ever come from the actual Billing Service, i.e.
     non-stub mode, so these tests flip BILLING_STUB_MODE off to actually
     exercise the branch (mirrors TestNonStubModeMocksExternalBillingClient's
-    pattern below)."""
+    pattern below).
+
+    Non-stub mode now also resolves the downgrade target from the billing
+    catalog (_get_catalog_free_entitlements, Mesh #963f0870) instead of a
+    hardcoded constant -- these tests mock that resolver directly so they
+    stay pure wiring tests ("does check_limit apply what the resolver
+    returns") rather than re-testing catalog-resolution itself, which has
+    its own dedicated coverage in TestCatalogFreeEntitlements below, and so
+    they never make a real network call to billing_base_url's default
+    (https://billing.entire.vc/api/v1)."""
+
+    _CATALOG_FREE_ENTITLEMENTS = {
+        k: billing_stub._format_entitlement_value(v)
+        for k, v in billing_stub.STUB_PLANS["free"]["entitlements"].items()
+    }
 
     @pytest.fixture(autouse=True)
     def _non_stub_for_grace_fallback(self):
         os.environ["BILLING_STUB_MODE"] = "false"
         get_settings.cache_clear()
-        yield
+        with patch.object(
+            billing_service,
+            "_get_catalog_free_entitlements",
+            AsyncMock(return_value=self._CATALOG_FREE_ENTITLEMENTS),
+        ):
+            yield
         os.environ["BILLING_STUB_MODE"] = "true"
         get_settings.cache_clear()
 
@@ -617,12 +638,22 @@ class TestGracePeriodFallbackViaRoute:
         # it off too, or it would pass for the wrong reason (Builder's higher
         # limit, not Free's). Non-stub mode requires a service token at app
         # startup (M-16 validation in main.py) even though our casdoor_id's
-        # entitlements come entirely from the pre-seeded cache and never hit
-        # the real client.
+        # subscription state comes entirely from the pre-seeded cache -- the
+        # downgrade target itself is now resolved via
+        # _get_catalog_free_entitlements (Mesh #963f0870), mocked here for
+        # the same reason as the sibling class above: this is a wiring test,
+        # not catalog-resolution coverage, and must not hit the real client.
         os.environ["BILLING_STUB_MODE"] = "false"
         os.environ["BILLING_SERVICE_TOKEN"] = "test-service-token"
         get_settings.cache_clear()
-        yield
+        catalog_free = {
+            k: billing_stub._format_entitlement_value(v)
+            for k, v in billing_stub.STUB_PLANS["free"]["entitlements"].items()
+        }
+        with patch.object(
+            billing_service, "_get_catalog_free_entitlements", AsyncMock(return_value=catalog_free)
+        ):
+            yield
         os.environ["BILLING_STUB_MODE"] = "true"
         os.environ.pop("BILLING_SERVICE_TOKEN", None)
         get_settings.cache_clear()
@@ -711,6 +742,134 @@ class TestMemberLimitEnforcementViaRoute:
         )
         assert resp.status_code == 403
         assert resp.json()["limit"] == "max_members_per_share"
+
+
+class TestInviteRedeemMemberLimitEnforcementViaRoute:
+    """Companion to TestMemberLimitEnforcementViaRoute (#7703d4fe): the
+    owner/admin-driven POST /shares/{id}/members route has always enforced
+    max_members_per_share. Invite-link redemption -- by far the more common
+    way a member actually joins a share -- added the ShareMember row
+    unconditionally, with no check at all."""
+
+    def test_invite_redeem_beyond_max_members_per_share_rejected(self, client: TestClient):
+        owner_token = register_and_login(client, "invite-limit-owner@example.com")
+        share_resp = client.post(
+            "/shares",
+            json={"kind": "doc", "path": "invite-limit.md"},
+            headers=auth_headers(owner_token),
+        )
+        assert share_resp.status_code == 201, share_resp.text
+        share_id = share_resp.json()["id"]
+
+        # Free plan caps max_members_per_share at 3 -- fill it via invite
+        # redemption (not the direct add_member route this time).
+        for i in range(3):
+            invite_resp = client.post(
+                f"/shares/{share_id}/invites",
+                json={"role": "viewer"},
+                headers=auth_headers(owner_token),
+            )
+            assert invite_resp.status_code == 201, invite_resp.text
+            redeem_resp = client.post(
+                f"/invite/{invite_resp.json()['token']}/redeem",
+                json={
+                    "email": f"invite-limit-member-{i}@example.com",
+                    "password": "test-pass-123",
+                },
+            )
+            assert redeem_resp.status_code == 200, redeem_resp.text
+
+        # 4th member via a fresh invite must be rejected, same shape of error
+        # the direct add_member route already returns.
+        invite_resp = client.post(
+            f"/shares/{share_id}/invites",
+            json={"role": "viewer"},
+            headers=auth_headers(owner_token),
+        )
+        redeem_resp = client.post(
+            f"/invite/{invite_resp.json()['token']}/redeem",
+            json={"email": "invite-limit-member-extra@example.com", "password": "test-pass-123"},
+        )
+        assert redeem_resp.status_code == 403, redeem_resp.text
+        assert redeem_resp.json()["limit"] == "max_members_per_share"
+
+        # And the share really does still only have 3 members -- the rejected
+        # 4th redemption must not have partially applied.
+        members_resp = client.get(f"/shares/{share_id}/members", headers=auth_headers(owner_token))
+        assert len(members_resp.json()) == 3
+
+    def test_invite_redeem_idempotent_reredemption_not_blocked_at_cap(self, client: TestClient):
+        """A member re-redeeming an invite they already used must stay
+        idempotent even once the share is at its cap -- the limit check must
+        fire only for an ACTUAL new member, not merely because the share is
+        full of members who already exist."""
+        owner_token = register_and_login(client, "invite-limit-idem-owner@example.com")
+        share_resp = client.post(
+            "/shares",
+            json={"kind": "doc", "path": "invite-limit-idem.md"},
+            headers=auth_headers(owner_token),
+        )
+        share_id = share_resp.json()["id"]
+
+        first_token = None
+        for i in range(3):
+            invite_resp = client.post(
+                f"/shares/{share_id}/invites",
+                json={"role": "viewer"},
+                headers=auth_headers(owner_token),
+            )
+            invite_token = invite_resp.json()["token"]
+            if i == 0:
+                first_token = invite_token
+            redeem_resp = client.post(
+                f"/invite/{invite_token}/redeem",
+                json={
+                    "email": f"invite-limit-idem-member-{i}@example.com",
+                    "password": "test-pass-123",
+                },
+            )
+            assert redeem_resp.status_code == 200, redeem_resp.text
+
+        # Share is now at its cap (3/3). The first member re-authenticates and
+        # re-redeems their OWN invite token -- must still succeed.
+        member_token = login(client, "invite-limit-idem-member-0@example.com", "test-pass-123")
+        redeem_again_resp = client.post(
+            f"/invite/{first_token}/redeem",
+            headers=auth_headers(member_token),
+        )
+        assert redeem_again_resp.status_code == 200, redeem_again_resp.text
+
+    def test_invite_redeem_quota_not_enforced_when_billing_disabled(self, client: TestClient):
+        os.environ["BILLING_ENABLED"] = "false"
+        get_settings.cache_clear()
+        try:
+            owner_token = register_and_login(client, "invite-limit-off-owner@example.com")
+            share_resp = client.post(
+                "/shares",
+                json={"kind": "doc", "path": "invite-limit-off.md"},
+                headers=auth_headers(owner_token),
+            )
+            share_id = share_resp.json()["id"]
+
+            # Free plan caps max_members_per_share at 3 -- billing off must
+            # allow a 4th via invite redemption too.
+            for i in range(4):
+                invite_resp = client.post(
+                    f"/shares/{share_id}/invites",
+                    json={"role": "viewer"},
+                    headers=auth_headers(owner_token),
+                )
+                redeem_resp = client.post(
+                    f"/invite/{invite_resp.json()['token']}/redeem",
+                    json={
+                        "email": f"invite-limit-off-member-{i}@example.com",
+                        "password": "test-pass-123",
+                    },
+                )
+                assert redeem_resp.status_code == 200, redeem_resp.text
+        finally:
+            os.environ["BILLING_ENABLED"] = "true"
+            get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +1003,35 @@ class TestBillingPlansEndpoint:
         resp = client.get("/v1/billing/plans")
         assert resp.status_code == 200
         assert len(resp.json()["plans"]) == 2
+
+    def test_get_billing_plans_502s_on_billing_service_error(self, client: TestClient):
+        """Mesh #fa109ff5: a real (non-stub) Billing Service failure must
+        surface as an error to the caller, not a silently-substituted stub
+        catalog that looks like a healthy 200 response."""
+        from app.clients.billing_client import BillingServiceError
+
+        os.environ["BILLING_STUB_MODE"] = "false"
+        os.environ["BILLING_SERVICE_TOKEN"] = "test-service-token"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        try:
+            with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+                mock_client = AsyncMock()
+                mock_client.get_products.side_effect = BillingServiceError(
+                    code="UPSTREAM_DOWN", message="unavailable", status=502
+                )
+                mock_get_client.return_value = mock_client
+
+                resp = client.get("/v1/billing/plans")
+                assert resp.status_code == 502
+                # app.middleware.errors.http_exception_handler wraps HTTPException.detail
+                # into {"error": {"message": ...}}, not a bare "detail" key.
+                assert resp.json()["error"]["message"] == "Billing Service temporarily unavailable"
+        finally:
+            os.environ["BILLING_STUB_MODE"] = "true"
+            os.environ.pop("BILLING_SERVICE_TOKEN", None)
+            get_settings.cache_clear()
+            billing_service._billing_client = None
 
 
 class TestCheckoutEndpoint:
@@ -1423,10 +1611,28 @@ class TestFindUserByBillingIdentityAmbiguousProviderUserId:
 
 class TestServerInfoBilling:
     def test_billing_enabled_true_when_configured(self, client: TestClient):
+        """Genuine positive control: billing_enabled=true requires BOTH
+        BILLING_ENABLED=true AND BILLING_STUB_MODE=false (Mesh #fa109ff5) --
+        the file's ambient default is BILLING_STUB_MODE=true, so this test
+        must explicitly turn stub mode off to represent real billing."""
+        os.environ["BILLING_STUB_MODE"] = "false"
+        get_settings.cache_clear()
+        try:
+            resp = client.get("/server/info")
+            assert resp.status_code == 200
+            assert resp.json()["edition"] == "enterprise"
+            assert resp.json()["features"]["billing_enabled"] is True
+        finally:
+            os.environ["BILLING_STUB_MODE"] = "true"
+            get_settings.cache_clear()
+
+    def test_billing_enabled_false_when_stub_mode_on(self, client: TestClient):
+        """Mesh #fa109ff5: the actual incident shape -- BILLING_ENABLED=true
+        (file default) with BILLING_STUB_MODE=true (also file default) must
+        report billing_enabled=false. A stub catalog is not real billing."""
         resp = client.get("/server/info")
         assert resp.status_code == 200
-        assert resp.json()["edition"] == "enterprise"
-        assert resp.json()["features"]["billing_enabled"] is True
+        assert resp.json()["features"]["billing_enabled"] is False
 
     def test_billing_enabled_false_by_default(self, client: TestClient):
         os.environ["BILLING_ENABLED"] = "false"
@@ -1500,6 +1706,38 @@ class TestNonStubModeMocksExternalBillingClient:
             assert data["plan"] in ("Relay Free", "Unknown")
 
     @pytest.mark.asyncio
+    async def test_get_available_plans_raises_on_billing_service_error(self):
+        """Mesh #fa109ff5: get_available_plans() must NOT silently substitute
+        the dev stub catalog when a real (non-stub) Billing Service call
+        fails -- that reads to the caller as a healthy catalog response, not
+        an error, and is indistinguishable from success (the exact incident:
+        an instance that could not reach Billing showed the international
+        USD catalog with zero errors). BillingServiceError must propagate;
+        the /v1/billing/plans router maps it to a 502 (see
+        TestBillingPlansEndpoint.test_get_billing_plans_502s_on_billing_service_error).
+        """
+        from app.clients.billing_client import BillingServiceError
+
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_products.side_effect = BillingServiceError(
+                code="UPSTREAM_DOWN", message="unavailable", status=502
+            )
+            mock_get_client.return_value = mock_client
+
+            with pytest.raises(BillingServiceError):
+                await billing_service.get_available_plans()
+
+    @pytest.mark.asyncio
+    async def test_get_available_plans_still_stubs_in_stub_mode(self):
+        """Regression guard: stub mode itself is untouched -- only the
+        except-branch silent-fallback-on-real-failure was removed."""
+        os.environ["BILLING_STUB_MODE"] = "true"
+        get_settings.cache_clear()
+        plans = await billing_service.get_available_plans()
+        assert len(plans) == 2  # stub catalog, unaffected by this change
+
+    @pytest.mark.asyncio
     async def test_create_checkout_session_calls_billing_client(self):
         with patch.object(billing_service, "_get_billing_client") as mock_get_client:
             mock_client = AsyncMock()
@@ -1521,6 +1759,211 @@ class TestNonStubModeMocksExternalBillingClient:
             )
             assert result["checkout_url"] == "https://billing.entire.vc/checkout/abc"
             mock_client.create_subscription.assert_awaited_once()
+
+
+class TestCatalogFreeEntitlements:
+    """Mesh #963f0870: `get_entitlements_cached`'s free-tier fallback (billing
+    returns empty entitlements -- the normal state for a user without a
+    subscription) used to substitute a hardcoded STUB_PLANS["free"] constant
+    regardless of which service_id was actually configured. That silently
+    diverged from the catalog on day one (STUB free max_members_per_share=3
+    vs the real relay product's 3 by luck, but relay-ru's real free product
+    is 1 share / 5 members / RUB, nothing like the USD stub) and would have
+    handed RU users USD-market limits the moment their instance pointed at
+    real billing.
+
+    These tests exercise `_get_catalog_free_entitlements` directly and via
+    `get_entitlements_cached`, proving: (1) the fallback now tracks whatever
+    the billing catalog says for the current service_id, not a constant; (2)
+    relay and relay-ru resolve to their own, different free products; (3)
+    STUB_PLANS is still used, but ONLY when the catalog fetch itself fails
+    -- a distinct condition from "no subscription", which this fix resolves
+    correctly instead of masking with the stub."""
+
+    @pytest.fixture(autouse=True)
+    def _non_stub(self):
+        os.environ["BILLING_STUB_MODE"] = "false"
+        os.environ["BILLING_SERVICE_TOKEN"] = "test-service-token"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        billing_service._free_product_cache.clear()
+        yield
+        os.environ["BILLING_STUB_MODE"] = "true"
+        os.environ.pop("BILLING_SERVICE_TOKEN", None)
+        os.environ.pop("BILLING_SERVICE_ID", None)
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        billing_service._free_product_cache.clear()
+
+    @staticmethod
+    def _catalog_with_free_product(entitlements: dict, amount: int = 0) -> dict:
+        return {
+            "products": [
+                {
+                    "id": "prod_test_free",
+                    "name": "Test Free",
+                    "prices": [{"id": "price_test_free", "amount": amount, "currency": "RUB"}],
+                    "entitlements": entitlements,
+                },
+                {
+                    "id": "prod_test_paid",
+                    "name": "Test Paid",
+                    "prices": [{"id": "price_test_paid", "amount": 90000, "currency": "RUB"}],
+                    "entitlements": {"max_shares": {"limit": 999}},
+                },
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_free_fallback_uses_catalog_not_stub_plans_constant(self):
+        """The core fix. Catalog entitlements are chosen to differ from
+        STUB_PLANS['free'] (max_shares=3) on purpose -- if the code still
+        read the hardcoded constant instead of the catalog, this fails."""
+        ru_free_entitlements = {
+            "max_shares": {"limit": 1},
+            "max_members_per_share": {"limit": 5},
+            "max_web_published": {"limit": 1},
+            "allowed_web_visibility": {"allowed": ["public"]},
+        }
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            # Real billing returns success with empty entitlements for a
+            # user without a subscription -- exactly the shape that used to
+            # trigger the STUB_PLANS substitution.
+            mock_client.get_entitlements.return_value = {
+                "plan": None,
+                "subscription": None,
+                "entitlements": {},
+            }
+            mock_client.get_products.return_value = self._catalog_with_free_product(
+                ru_free_entitlements
+            )
+            mock_get_client.return_value = mock_client
+
+            data = await billing_service.get_entitlements_cached("cid-catalog-free")
+
+        assert data["entitlements"] == ru_free_entitlements
+        assert data["entitlements"]["max_shares"]["limit"] != 3  # not the STUB_PLANS value
+
+    @pytest.mark.asyncio
+    async def test_free_fallback_distinguishes_service_ids(self):
+        """relay and relay-ru must each resolve their OWN free product's
+        entitlements, never the other's (task AC#4)."""
+        relay_free = {"max_shares": {"limit": 3}, "max_members_per_share": {"limit": 3}}
+        relay_ru_free = {"max_shares": {"limit": 1}, "max_members_per_share": {"limit": 5}}
+
+        os.environ["BILLING_SERVICE_ID"] = "relay"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_entitlements.return_value = {
+                "plan": None,
+                "subscription": None,
+                "entitlements": {},
+            }
+            mock_client.get_products.return_value = self._catalog_with_free_product(relay_free)
+            mock_get_client.return_value = mock_client
+            data_relay = await billing_service.get_entitlements_cached("cid-relay")
+        assert data_relay["entitlements"] == relay_free
+
+        os.environ["BILLING_SERVICE_ID"] = "relay-ru"
+        get_settings.cache_clear()
+        billing_service._billing_client = None
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_entitlements.return_value = {
+                "plan": None,
+                "subscription": None,
+                "entitlements": {},
+            }
+            mock_client.get_products.return_value = self._catalog_with_free_product(relay_ru_free)
+            mock_get_client.return_value = mock_client
+            data_ru = await billing_service.get_entitlements_cached("cid-ru")
+        assert data_ru["entitlements"] == relay_ru_free
+        assert data_ru["entitlements"] != data_relay["entitlements"]
+
+    @pytest.mark.asyncio
+    async def test_free_fallback_uses_stub_plans_only_when_catalog_unreachable(self):
+        """Genuine emergency: the catalog fetch itself fails (a real
+        BillingServiceError, not '200 with no zero-price product'). Only
+        THEN does STUB_PLANS apply -- distinct from the no-subscription case
+        in test_free_fallback_uses_catalog_not_stub_plans_constant above,
+        where billing is reachable and the catalog resolves fine."""
+        from app.clients.billing_client import BillingServiceError
+
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_entitlements.return_value = {
+                "plan": None,
+                "subscription": None,
+                "entitlements": {},
+            }
+            mock_client.get_products.side_effect = BillingServiceError(
+                code="UPSTREAM_DOWN", message="unavailable", status=502
+            )
+            mock_get_client.return_value = mock_client
+
+            data = await billing_service.get_entitlements_cached("cid-catalog-down")
+
+        stub_free = {
+            k: billing_stub._format_entitlement_value(v)
+            for k, v in billing_stub.STUB_PLANS["free"]["entitlements"].items()
+        }
+        assert data["entitlements"] == stub_free
+
+    @pytest.mark.asyncio
+    async def test_catalog_free_entitlements_cached(self):
+        """A second call within the 5-minute TTL must not re-fetch the
+        catalog (mirrors the existing entitlements-cache test pattern)."""
+        entitlements = {"max_shares": {"limit": 1}}
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_products.return_value = self._catalog_with_free_product(entitlements)
+            mock_get_client.return_value = mock_client
+
+            first = await billing_service._get_catalog_free_entitlements()
+            second = await billing_service._get_catalog_free_entitlements()
+
+        assert first == entitlements
+        assert second == entitlements
+        mock_client.get_products.assert_awaited_once()
+
+    def test_billing_plan_route_reflects_catalog_free_entitlements(
+        self, client: TestClient, db_session
+    ):
+        """Route-level companion, per the task's own AC#2 wording ('что
+        отдаёт /v1/billing/plan безподписочному пользователю')."""
+        from app.db import models
+
+        token = register_and_login(client, "catalog-free-route@example.com")
+        user = db_session.query(models.User).filter_by(email="catalog-free-route@example.com").one()
+        user.casdoor_id = "catalog-free-route-cid"
+        db_session.commit()
+
+        ru_free_entitlements = {
+            "max_shares": {"limit": 1},
+            "max_members_per_share": {"limit": 5},
+            "max_web_published": {"limit": 1},
+            "allowed_web_visibility": {"allowed": ["public"]},
+        }
+        with patch.object(billing_service, "_get_billing_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.get_entitlements.return_value = {
+                "plan": None,
+                "subscription": None,
+                "entitlements": {},
+            }
+            mock_client.get_products.return_value = self._catalog_with_free_product(
+                ru_free_entitlements
+            )
+            mock_get_client.return_value = mock_client
+
+            resp = client.get("/v1/billing/plan", headers=auth_headers(token))
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["usage"]["shares"]["max"] == 1  # catalog value, not STUB_PLANS' 3
 
 
 # ---------------------------------------------------------------------------

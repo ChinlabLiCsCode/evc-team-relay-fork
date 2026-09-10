@@ -101,14 +101,31 @@ resolve_smoke_url() {
 # key resolves to False, mirroring Settings.billing_enabled's own default, so
 # a host that never set the key gets the same expectation the running app
 # actually computed.
+#
+# Mirrors app/api/routers/server.py's ServerFeatures.billing_enabled formula
+# (Mesh #fa109ff5): a stubbed catalog isn't real billing, so /server/info now
+# reports billing_enabled=false whenever BILLING_STUB_MODE=true, even with
+# BILLING_ENABLED=true. This function must compute the SAME AND — otherwise a
+# host deliberately left in stub mode (billing_enabled=true, stub=true, e.g. a
+# demo/staging box) would expect True, get False from /server/info, and the
+# smoke gate would false-positive-fail and auto-rollback a correctly running host.
 resolve_expected_billing() {
   local relay_dir="$1"
-  local _raw
-  _raw="$(grep -m1 '^BILLING_ENABLED=' "$relay_dir/.env" 2>/dev/null | cut -d= -f2-)"
-  case "$(printf '%s' "$_raw" | tr '[:upper:]' '[:lower:]')" in
-    true|1|yes) printf 'True\n' ;;
-    *) printf 'False\n' ;;
+  local _enabled_raw _stub_raw
+  _enabled_raw="$(grep -m1 '^BILLING_ENABLED=' "$relay_dir/.env" 2>/dev/null | cut -d= -f2-)"
+  _stub_raw="$(grep -m1 '^BILLING_STUB_MODE=' "$relay_dir/.env" 2>/dev/null | cut -d= -f2-)"
+  local _enabled=false _stub=true  # stub defaults to True, mirroring Settings.billing_stub_mode
+  case "$(printf '%s' "$_enabled_raw" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) _enabled=true ;;
   esac
+  case "$(printf '%s' "$_stub_raw" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no) _stub=false ;;
+  esac
+  if [ "$_enabled" = "true" ] && [ "$_stub" = "false" ]; then
+    printf 'True\n'
+  else
+    printf 'False\n'
+  fi
 }
 
 case "$COMPONENT" in
