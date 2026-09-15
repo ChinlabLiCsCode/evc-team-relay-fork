@@ -464,6 +464,7 @@ def list_members(db: Session, share: models.Share) -> list[dict]:
                 "user_id": member.user_id,
                 "user_email": email,
                 "role": member.role,
+                "created_at": member.created_at,
             }
         )
     return members
