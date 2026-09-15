@@ -72,7 +72,7 @@
         <tbody>
             {% for member in members %}
             <tr>
-                <td>{{ member.user.email }}</td>
+                <td>{{ member.user_email }}</td>
                 <td>
                     <form method="post" action="/admin-ui/shares/{{ share.id }}/members/{{ member.user_id }}/role" style="margin: 0;">
                         <select name="role" onchange="this.form.submit()" class="select-compact">
@@ -83,7 +83,7 @@
                 </td>
                 <td>{{ member.created_at.strftime('%Y-%m-%d') if member.created_at else '-' }}</td>
                 <td style="text-align: right;">
-                    <button class="btn btn-danger btn-sm" onclick="removeMember('{{ share.id }}', '{{ member.user_id }}', '{{ member.user.email }}')">Remove</button>
+                    <button class="btn btn-danger btn-sm" onclick="removeMember('{{ share.id }}', '{{ member.user_id }}', '{{ member.user_email }}')">Remove</button>
                 </td>
             </tr>
             {% endfor %}
