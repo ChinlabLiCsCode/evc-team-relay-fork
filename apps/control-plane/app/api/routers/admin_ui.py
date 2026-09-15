@@ -619,7 +619,10 @@ def share_detail(
         all_users = user_service.list_users(db)
 
         # Filter out users who are already members or the owner
-        member_user_ids = {m.user_id for m in members}
+        # share_service.list_members returns plain dicts (see its own
+        # docstring), not ShareMember ORM rows — attribute access here
+        # raised AttributeError on every share with >=1 member (#6ede8840).
+        member_user_ids = {m["user_id"] for m in members}
         available_users = [
             u for u in all_users if u.id not in member_user_ids and u.id != share.owner_user_id
         ]
