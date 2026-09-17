@@ -9,9 +9,10 @@ Licensed under the Apache License, Version 2.0.
 
 This project includes the following third-party components:
 
-y-sweet (Relay Server)
+Relay Server (Rust CRDT sync core)
   License: MIT
-  Source: https://github.com/jamsocket/y-sweet
+  Source: https://github.com/No-Instructions/relay-server
+  Derived from: https://github.com/jamsocket/y-sweet
 
 Yjs (CRDT Library)
   License: MIT
