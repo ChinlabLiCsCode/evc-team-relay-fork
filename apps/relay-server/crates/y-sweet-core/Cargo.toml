@@ -1,0 +1,51 @@
+[package]
+name = "y-sweet-core"
+version = "0.8.2"
+edition = "2021"
+description = "Sans-IO core of the y-sweet yjs CRDT server."
+license = "MIT"
+homepage = "https://y-sweet.dev"
+repository = "https://github.com/drifting-in-space/y-sweet"
+
+[features]
+default = ["sync"]
+sync = ["yrs/sync"]
+single-threaded = []
+
+[dependencies]
+anyhow = "1.0.72"
+async-trait = "0.1.71"
+bincode = "1.3.3"
+bytes = "1.5.0"
+chrono = { version = "0.4.31", features = ["serde"] }
+data-encoding = "2.4.0"
+getrandom = { version = "0.2.10", features = ["js"] }
+nanoid = "0.4.0"
+rand = "0.8.5"
+reqwest = { version = "0.12.5", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+rusty-s3 = "0.9.1"
+jiff = { version = "0.2.1", features = ["std"] }
+quick-xml = "0.41.0"
+serde = { version = "1.0.173", features = ["derive"] }
+serde_json = "1.0.103"
+sha2 = "0.10.7"
+hmac = "0.12.1"
+thiserror = "1.0.44"
+toml = "0.8"
+coset = "0.3.7"
+ciborium = "0.2.2"
+p256 = "0.13.2"
+ecdsa = "0.16.9"
+ed25519-dalek = { version = "2.1.1", features = ["pkcs8", "pem"] }
+time = { version = "0.3.25", features = ["wasm-bindgen", "parsing"] }
+tokio = { version = "1.29.1", features = ["time"] }
+urlencoding = "2.1.3"
+tracing = "0.1.37"
+url = "2.5.0"
+yrs = { version = "0.26.0" }
+yrs-kvstore = "0.3.0"
+prometheus = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread"] }
+dashmap = "6.0.1"
