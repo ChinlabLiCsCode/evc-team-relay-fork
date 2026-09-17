@@ -86,8 +86,10 @@ Edit `relay/relay.toml`:
   `RELAY_AUDIENCE` unset, must equal `https://${DOMAIN_BASE}` — the default control-plane
   derives from `RELAY_PUBLIC_URL`'s host). A mismatch here fails silently: tokens are issued
   and signed correctly but every WebSocket connection is rejected with no useful log line.
-  Remember there is no separate `relay.` subdomain (step 4 below) — this is
-  `https://yourdomain.com`, not `https://relay.yourdomain.com`.
+  On the default single-domain install this is `https://yourdomain.com`. Putting the relay
+  on its own subdomain instead is also supported (step 4 below) — in that case this is
+  `https://relay.yourdomain.com`, matching `RELAY_DOMAIN`; see
+  [Running behind an external proxy](reverse-proxy.md) for the full subdomain layout.
 - `[store]` — MinIO credentials from `.env` (`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`).
 - `[[auth]]` — `key_id` matches `RELAY_KEY_ID` in `.env` if you set one (defaults to `relay_cp_dev`
   if omitted); `public_key` is the Ed25519 public key derived from the private key you generated
@@ -105,7 +107,7 @@ Edit `relay/relay.toml`:
 
 ### 4. Configure DNS
 
-`DOMAIN_BASE` itself is the relay server's domain — there is no separate `relay.` subdomain.
+On the default single-domain install, `DOMAIN_BASE` itself is the relay server's domain.
 Point these DNS records to your server IP:
 
 | Record | Type | Value |
@@ -113,6 +115,10 @@ Point these DNS records to your server IP:
 | `yourdomain.com` (i.e. your `DOMAIN_BASE`) | A | Your server IP |
 | `cp.yourdomain.com` | A | Your server IP |
 | `docs.yourdomain.com` | A | Your server IP (optional, for web publishing) |
+
+> If you set `RELAY_DOMAIN` to its own subdomain instead of the bare domain (see
+> [Running behind an external proxy](reverse-proxy.md)), add an `A` record for that
+> hostname too, pointing at the same server IP.
 
 ### 5. Review Caddy Configuration
 
@@ -316,6 +322,17 @@ Ensure DNS records are properly configured and ports 80/443 are accessible.
 docker compose exec control-plane curl -s http://localhost:8000/health
 docker compose exec relay-server curl -s http://localhost:9090/metrics | head -5
 ```
+
+### Shares Visible, Content Not Syncing
+
+Login and the share list work, but document contents never arrive or seem to
+disappear later. This means the control plane (shares, membership) is healthy
+but the relay/storage path (`relay-server` + MinIO) is not — health checks
+don't cover that path at all. See
+[Running behind an external proxy](reverse-proxy.md#6-verify-by-outcome-not-by-health-check)
+for the two commands that verify it directly, and check `relay/relay.toml`
+against `.env` — `relay-server` does not read `.env` at all, so the two files
+can silently disagree.
 
 ## Next Steps
 

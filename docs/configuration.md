@@ -213,8 +213,10 @@ The `Caddyfile` in the `infra/` directory configures Caddy as a reverse proxy wi
 
 ### WebSocket Token Proxy
 
-Relay server (`{$DOMAIN_BASE}` — there is no separate `relay.` subdomain) authenticates
-WebSocket connections using CWT (CBOR Web Token) tokens. For plain HTTP endpoints, since the
+Relay server (`{$DOMAIN_BASE}` on the default single-domain install, or your own
+`{$RELAY_DOMAIN}` if you put it on a subdomain — see
+[reverse-proxy.md](reverse-proxy.md)) authenticates WebSocket connections using CWT
+(CBOR Web Token) tokens. For plain HTTP endpoints, since the
 browser WebSocket API (`new WebSocket(url)`) does not support custom headers, Caddy extracts
 the `?token=` query parameter and rewrites it as an `Authorization: Bearer` header. The
 WebSocket-upgrade paths are explicitly excluded from that rewrite: relay-server's own

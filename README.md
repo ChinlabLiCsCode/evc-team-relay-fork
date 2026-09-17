@@ -120,6 +120,7 @@ Then install the [Obsidian plugin](https://github.com/entire-vc/evc-team-relay-p
 Technical documentation is available in [`docs/`](./docs/):
 - [Installation](./docs/installation.md)
 - [Configuration](./docs/configuration.md) — includes [Web Publishing](./docs/configuration.md#web-publishing) and [Monitoring](./docs/configuration.md#monitoring)
+- [Reverse Proxy](./docs/reverse-proxy.md) — running behind an external TLS-terminating proxy or CDN
 - [API Reference](./docs/api.md)
 
 ---

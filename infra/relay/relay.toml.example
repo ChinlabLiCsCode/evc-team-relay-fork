@@ -1,10 +1,11 @@
 [server]
 # MUST equal RELAY_AUDIENCE in .env exactly (control-plane's aud claim is checked
-# against this string byte-for-byte). DOMAIN_BASE is your base domain, e.g.
-# example.com — installation.md step 4: there is no separate relay. subdomain,
-# so this is https://{DOMAIN_BASE}, NOT https://relay.{DOMAIN_BASE}. If you
-# leave RELAY_AUDIENCE unset, the control-plane derives the same value from
-# RELAY_PUBLIC_URL's host — see docs/configuration.md.
+# against this string byte-for-byte). On the default single-domain install this
+# is https://{DOMAIN_BASE}; if you put the relay on its own subdomain instead
+# (a supported layout, see docs/reverse-proxy.md), it's https://{RELAY_DOMAIN}
+# — either way, this must be the exact host your relay is actually served on.
+# If you leave RELAY_AUDIENCE unset, the control-plane derives the same value
+# from RELAY_PUBLIC_URL's host — see docs/configuration.md.
 url = "https://example.com"
 host = "0.0.0.0"
 port = 8080
