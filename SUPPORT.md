@@ -43,11 +43,11 @@ the thread than go quiet.
 
 ## What is not handled here
 
-This repository holds the control plane, web publishing, and deployment infrastructure. Some things
-live elsewhere:
+This repository holds the control plane, the relay server (the Rust sync core, under
+`apps/relay-server/`), web publishing, and deployment infrastructure. Some things live
+elsewhere:
 
 - **The Obsidian plugin** — [evc-team-relay-plugin](https://github.com/entire-vc/evc-team-relay-plugin).
-- **The relay server (the Rust sync core)** — [evc-relay-server](https://github.com/entire-vc/evc-relay-server).
 - **The MCP server** — [evc-team-relay-mcp](https://github.com/entire-vc/evc-team-relay-mcp).
 
 If you are not sure which one broke, open the issue here. Routing it is our job, not yours.
