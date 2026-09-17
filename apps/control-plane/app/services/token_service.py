@@ -148,6 +148,8 @@ def issue_relay_token(
     }
     if share.kind == models.ShareKind.FOLDER and payload.file_path:
         details["file_path"] = payload.file_path
+    if payload.client_version:
+        details["client_version"] = payload.client_version
     if agent_key is not None:
         details["agent_key_id"] = str(agent_key.id)
         agent_key.last_used_at = security.utcnow()
