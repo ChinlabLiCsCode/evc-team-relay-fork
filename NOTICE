@@ -9,25 +9,47 @@ Licensed under the Apache License, Version 2.0.
 
 This project includes the following third-party components:
 
-y-sweet (Relay Server)
+Relay Server (Rust CRDT sync core)
   License: MIT
-  Source: https://github.com/jamsocket/y-sweet
+  Source: https://github.com/No-Instructions/relay-server
+  Derived from: https://github.com/jamsocket/y-sweet
+  Full license text: apps/relay-server/LICENSE
 
-Yjs (CRDT Library)
-  License: MIT
-  Source: https://github.com/yjs/yjs
+  This component carries four MIT copyright notices. They are reproduced
+  below verbatim from apps/relay-server/LICENSE, in that file's own order:
+  our immediate upstream first, then each project whose code it adapted,
+  back to the original Yjs implementation.
+
+    Copyright (c) 2025 No Instructions, LLC.
+      relay-server - https://github.com/No-Instructions/relay-server
+
+    Copyright (c) 2023 Drifting in Space Corp.
+      y-sweet - https://github.com/jamsocket/y-sweet
+
+    Copyright (c) 2020
+      - Bartosz Sypytkowski <b.sypytkowski@gmail.com>
+      - Kevin Jahns <kevin.jahns@pm.me>.
+      y-crdt - https://github.com/y-crdt/y-crdt
+
+    Copyright (c) 2014
+      - Kevin Jahns <kevin.jahns@rwth-aachen.de>.
+      - Chair of Computer Science 5 (Databases & Information Systems), RWTH Aachen University, Germany
+      Yjs - https://github.com/yjs/yjs
 
 FastAPI
   License: MIT
-  Source: https://github.com/tiangolo/fastapi
+  Source: https://github.com/fastapi/fastapi
+  Copyright (c) 2018 Sebastián Ramírez
 
 SQLAlchemy
   License: MIT
   Source: https://github.com/sqlalchemy/sqlalchemy
+  Copyright 2005-2026 SQLAlchemy authors and contributors <see AUTHORS file>.
 
 SvelteKit (Web Publish)
   License: MIT
   Source: https://github.com/sveltejs/kit
+  Copyright (c) 2020 [these people](https://github.com/sveltejs/kit/graphs/contributors)
 
 ---
 
@@ -35,3 +57,12 @@ Attribution requirement (Apache 2.0):
 
 If you use this software, you must include this NOTICE file in your
 distribution and give appropriate credit to the original authors.
+
+Attribution requirement (MIT components):
+
+The MIT-licensed components listed above require that their copyright
+notice and permission notice be included in all copies or substantial
+portions of the software. Those notices must therefore travel with any
+redistribution of this product, including container images and
+self-hosted installations. The full permission notice for the relay
+server is in apps/relay-server/LICENSE.
