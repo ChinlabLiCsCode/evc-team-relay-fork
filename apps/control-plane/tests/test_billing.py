@@ -1571,8 +1571,8 @@ class TestFindUserByBillingIdentityAmbiguousProviderUserId:
         assert resolved.id == user.id
 
     def test_users_casdoor_id_is_globally_unique_at_the_db_level(self, db_session):
-        """The task's symmetric concern ('users.casdoor_id тоже не уникален')
-        does not hold: ix_users_casdoor_id is a real unique index (see
+        """The symmetric concern — that users.casdoor_id might not be unique
+        either — does not hold: ix_users_casdoor_id is a real unique index (see
         migration 202607250001), so two users can never share a
         casdoor_id — this documents that find_user_by_billing_identity()'s
         casdoor_id branch needs no equivalent fix, with a live DB-level
@@ -1932,8 +1932,8 @@ class TestCatalogFreeEntitlements:
     def test_billing_plan_route_reflects_catalog_free_entitlements(
         self, client: TestClient, db_session
     ):
-        """Route-level companion, per the task's own AC#2 wording ('что
-        отдаёт /v1/billing/plan безподписочному пользователю')."""
+        """Route-level companion: what /v1/billing/plan returns for a user
+        without a subscription."""
         from app.db import models
 
         token = register_and_login(client, "catalog-free-route@example.com")

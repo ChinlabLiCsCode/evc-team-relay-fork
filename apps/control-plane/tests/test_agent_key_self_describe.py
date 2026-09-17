@@ -1,4 +1,4 @@
-"""Self-describe endpoint for agent keys (task bc11d499, requested by Mesh/Garfield).
+"""Self-describe endpoint for agent keys.
 
 Mesh holds an agent key issued by a Team Relay share owner but is not itself
 the owner, so it has no way to learn its own key's expires_at/scopes/
@@ -6,13 +6,13 @@ last_used_at short of parsing a 403 after the fact. GET .../agent-key lets the
 key holder read its own key's metadata — nothing about any other key on the
 share, and never the key material itself.
 
-Decisions carried from the task thread (Daedalus, Р1-Р6) and enforced here:
-  Р1: last_used_at is NOT updated by this route.
-  Р2: no scope is required to call it — a write-only key must be able to
+Design decisions enforced here:
+  D1: last_used_at is NOT updated by this route.
+  D2: no scope is required to call it — a write-only key must be able to
       discover that it is write-only.
-  Р3: revoked_at is never in the response (a revoked key never reaches the
+  D3: revoked_at is never in the response (a revoked key never reaches the
       response at all — it is rejected first).
-  Р4: its own response model, not agent_keys.AgentKeyListItem — no created_by,
+  D4: its own response model, not agent_keys.AgentKeyListItem — no created_by,
       no risk of a future owner-facing field leaking here by reuse.
 """
 
@@ -298,7 +298,7 @@ class _FakeRequest:
 
 
 # --------------------------------------------------------------------------
-# AC5 (Р1) — last_used_at is not touched by self-describing
+# AC5 (D1) — last_used_at is not touched by self-describing
 # --------------------------------------------------------------------------
 
 
@@ -332,7 +332,7 @@ class TestLastUsedAtUntouched:
 
 
 # --------------------------------------------------------------------------
-# AC6 (Р2) — write-only key can see its own scopes
+# AC6 (D2) — write-only key can see its own scopes
 # --------------------------------------------------------------------------
 
 
