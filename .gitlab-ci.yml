@@ -35,8 +35,8 @@
 #
 # A pipeline is a display until `only_allow_merge_if_pipeline_succeeds` is true
 # on the project — until then GitLab merges over a red run via the web button
-# or a bare `glab mr merge`. That setting needs Maintainer; the sole holder of
-# 40+ on this group is `pavel`. Tracked separately (`#11421131`).
+# or a bare `glab mr merge`. That setting requires Maintainer rights on the
+# project and is tracked separately.
 
 workflow:
   rules:
@@ -171,8 +171,9 @@ alembic-migration-smoke:
 # `allow_failure: true` while ~50 ops of PRE-EXISTING model/migration drift
 # (unique-constraint duplication, idx_* vs SQLAlchemy's default ix_* naming,
 # TEXT vs unbounded String, missing NOT NULL) accumulated well before this job
-# existed sat unreconciled — reconciled in 202608260001_reconcile_model_schema_drift.py
-# (Mesh task af34b19f). The flag is gone now that the job is actually green;
+# existed sat unreconciled — reconciled in
+# 202608260001_reconcile_model_schema_drift.py. The flag is gone now that the
+# job is actually green;
 # see that migration's docstring for exactly what was and wasn't safe to
 # apply (six of autogenerate's proposed drops turned out to be live partial
 # indexes on real hot-path queries — fixed in the model, not dropped).
@@ -194,25 +195,17 @@ check-migration-drift:
     - uv run alembic check
 
 # ── web-publish (SvelteKit) ─────────────────────────────────────────────────
-# These two were absent from the first version of this file, and the header
-# said why: the lockfile pinned @entire-vc/tokens and @entire-vc/ui-svelte to
-# npm.pkg.github.com, and `npm ci` installs from `resolved`, so repointing the
-# registry alone did not redirect them.
+# @entire-vc/tokens and @entire-vc/ui-svelte are published on the PUBLIC npm
+# registry, so `npm ci` here needs no registry config and no credential at all.
 #
-# That was true and is now fixed at the source: both packages were ALREADY
-# published in the GitLab Package Registry of evc-brandkit (project 9) at
-# exactly the pinned versions — nothing had to be published, and no Maintainer
-# rights were needed. The lockfile's two entries were re-resolved against it.
-#
-# ⚠️ Auth is written to ~/.npmrc HERE rather than living in the repo's .npmrc
-# as a ${VAR} placeholder. That is deliberate: npm does not error on an
-# unexpanded ${VAR}, it takes the string literally and sends it as the token,
-# so a missing variable degrades into a confusing 401 instead of a clear
-# failure. CI_JOB_TOKEN is always populated by the runner, so no emptiness
-# check is needed — unlike the GITHUB_TOKEN this replaced.
-#
-# evc-brandkit has ci_job_token_scope_enabled=false, so no allowlist entry is
-# required for this project to read its packages.
+# History, because this job carried a token twice and both times it broke the
+# other pipeline: the lockfile first pinned the two packages to
+# npm.pkg.github.com (GitLab runners have no GitHub token — red here), then to
+# the GitLab Package Registry of evc-brandkit, project 9 (GitHub runners cannot
+# reach git.entire.host — red there). A private scope readable by exactly one
+# of the two CI systems is unfixable by picking the other side; publishing the
+# packages publicly is what ends the swap. The public copies also keep the
+# showcase mirror's lockfile free of an internal hostname and project number.
 .web_publish_job: &web_publish_job
   image: node:22-alpine
   timeout: 20m
@@ -223,7 +216,6 @@ check-migration-drift:
   variables:
     npm_config_cache: "$CI_PROJECT_DIR/apps/web-publish/.npm"
   before_script:
-    - printf '//git.entire.host/api/v4/projects/9/packages/npm/:_authToken=%s\n' "$CI_JOB_TOKEN" > ~/.npmrc
     - cd apps/web-publish
     - npm ci
 
@@ -238,81 +230,87 @@ test-svelte:
   stage: test
   script:
     - npm test
-
 # ── deploy ──────────────────────────────────────────────────────────────────
-# Выкатка прод-контрол-плейна по мёржу в канон. До этой джобы её поднимал
-# человек кнопкой в `entire-vc/deploy`; списано с `trigger:prod-backend` в
-# `entire-vc/evc-mesh:.gitlab-ci.yml`, где тот же мост живёт с 28.08.
+# Ships the production control plane on merge to the canonical branch. Before
+# this job a human had to press the button in `entire-vc/deploy`; modelled on
+# the `trigger:prod-backend` bridge in `entire-vc/evc-mesh:.gitlab-ci.yml`,
+# where the same bridge already runs.
 #
-# ## Область гейта = то, что эта выкатка РЕАЛЬНО везёт
+# ## Gate scope = what this deployment ACTUALLY ships
 #
-# `deploy:team-relay` клонирует этот репозиторий и rsync-ает `apps/control-plane`
-# на прод, следом гоняя миграции. Значит гейтить надо контрол-плейн целиком:
+# `deploy:team-relay` clones this repository, rsyncs `apps/control-plane` to
+# production and then runs the migrations. So the gate has to cover the whole
+# control plane:
 #
-#   входят  lint-python              ruff по тому же `apps/control-plane`;
-#           test-python              pytest по нему же;
-#           alembic-migration-smoke  ← НЕСУЩЕЕ. Единственное место, где граф
-#                                      миграций прогоняется против настоящей
-#                                      пустой базы;
-#           check-migration-drift    ← НЕСУЩЕЕ. `alembic check`: расхождение
-#                                      моделей и схемы.
+#   included  lint-python              ruff over that same `apps/control-plane`;
+#             test-python              pytest over the same tree;
+#             alembic-migration-smoke  ← LOAD-BEARING. The only place where the
+#                                        migration graph is run against a real
+#                                        empty database;
+#             check-migration-drift    ← LOAD-BEARING. `alembic check`: drift
+#                                        between the models and the schema.
 #
-# ⚠️ Две миграционные джобы здесь — не «ещё два теста». Из пяти продуктов
-# миграционный CI есть только у этого, и включение их в `needs` — то, что
-# превращает §1b («миграция ДО кода, никогда наоборот») из дисциплины агента
-# в машинный гейт. Автовыкатка без них означала бы, что код едет на прод по
-# мёржу, а расхождение схемы обнаруживается уже под живым 500 — то есть худшая
-# из возможных форм этого отказа, потому что она наступает после выкатки.
+# ⚠️ The two migration jobs here are not "two more tests". Including them in
+# `needs` is what turns "migration before code, never the other way round"
+# from a convention into a machine-enforced gate. Auto-deploying without them
+# would mean code reaches production on merge while a schema mismatch only
+# surfaces under a live 500 — the worst possible shape of that failure,
+# because it happens after the deployment.
 #
-#   не входит  hold-gate — см. ниже, это ловушка, а не экономия.
+#   excluded  hold-gate — see below; including it is a trap, not a saving.
 #
-# ## ⚠️ Почему hold-gate НЕЛЬЗЯ вписать в needs
+# ## ⚠️ Why hold-gate MUST NOT be listed in needs
 #
-# У него `rules: - if: $CI_PIPELINE_SOURCE == "merge_request_event"`, то есть в
-# пайплайне ПУША в `main` его не существует. Джоба, требующая отсутствующую,
-# ломает создание пайплайна целиком: мёрж не даст ни пайплайна, ни выкатки, и
-# НИ ОДНОЙ ошибки. Ровно на этом классе лежал MR !17 в deploy-проекте
-# (`failed`, ноль джоб).
+# It carries `rules: - if: $CI_PIPELINE_SOURCE == "merge_request_event"`, so
+# it does not exist at all in a push pipeline on `main`. A job that requires a
+# job which does not exist breaks pipeline creation entirely: the merge yields
+# no pipeline, no deployment, and NOT ONE error message.
 #
-# Состав `needs` ниже взят не из чтения этого файла, а замером живого
-# push-пайплайна на `main` (1182, коммит 4d28370d): в нём ровно четыре джобы —
-# lint-python, test-python, alembic-migration-smoke, check-migration-drift —
-# и `hold-gate` отсутствует. Правило шире: прежде чем вписать джобу в `needs`,
-# посмотри РЕАЛЬНЫЙ пайплайн пуша в `main`, а не yaml.
+# The `needs` list below was not derived by reading this file but by measuring
+# a real push pipeline on `main`: it contains exactly four jobs — lint-python,
+# test-python, alembic-migration-smoke, check-migration-drift — and no
+# `hold-gate`. The rule generalises: before adding a job to `needs`, look at an
+# ACTUAL push pipeline on `main`, not at the yaml.
 trigger:prod-team-relay:
   stage: deploy
-  # Только пуш в канон. На MR-пайплайнах не запускается: там деплоить нечего.
+  # Pushes to the canonical branch only. It does not run on merge request
+  # pipelines: there is nothing to deploy there.
   rules:
     - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
   needs: ["lint-python", "test-python", "alembic-migration-smoke", "check-migration-drift"]
-  # ⚠️ ЯВНО, вопреки `default: interruptible: true` выше. Прерываемая джоба
-  # была бы отменена следующим пушем в main — вместе с дочерним пайплайном,
-  # то есть посреди выкатки. У продукта с миграциями это самый дорогой момент
-  # прерывания: между `alembic upgrade head` и перезапуском приложения прод
-  # остаётся со схемой от нового кода и работающим старым.
+  # ⚠️ Set EXPLICITLY, against `default: interruptible: true` above. An
+  # interruptible job would be cancelled by the next push to main — together
+  # with its downstream pipeline, i.e. in the middle of a deployment. For a
+  # product with migrations that is the most expensive moment to be
+  # interrupted: between `alembic upgrade head` and the application restart,
+  # production is left holding the new code's schema while the old code runs.
   interruptible: false
   variables:
-    # Ключ, по которому deploy-проект отличает автозапуск от ручного нажатия.
+    # The key by which the deploy project tells an automatic trigger from a
+    # manual button press.
     DEPLOY_TEAM_RELAY: "1"
   trigger:
     project: entire-vc/deploy
     branch: main
-    # ⚠️ `strategy: depend` здесь НЕЛЬЗЯ, хотя по смыслу хотелось бы. Пайплайн
-    # в `entire-vc/deploy` ОБЩИЙ на все продукты, и его агрегатный статус висит
-    # на ручных джобах чужих продуктов, которые никто не обязан жать: из 30
-    # последних пайплайнов 25 так и остались `manual`. `depend` ждал бы
-    # терминального статуса вечно, а по таймауту дал бы КРАСНЫЙ на канон-main
-    # при успешно уехавшей выкатке. Ложный красный на каждом мёрже хуже
-    # отсутствия сигнала: он приучает не смотреть на цвет main.
+    # ⚠️ `strategy: depend` MUST NOT be used here, however much the semantics
+    # invite it. The pipeline in `entire-vc/deploy` is SHARED by all products,
+    # and its aggregate status hangs on manual jobs belonging to other products
+    # that nobody is obliged to press — most recent pipelines there simply stay
+    # `manual`. `depend` would wait forever for a terminal status and, on
+    # timeout, paint the canonical `main` RED even though the deployment
+    # succeeded. A false red on every merge is worse than no signal at all: it
+    # teaches people to stop looking at the colour of main.
     #
-    # Чем закрыт отказ выкатки вместо этого: `verify:team-relay` в
-    # deploy-пайплайне краснеет сам — он проверяет `/health` по СОДЕРЖИМОМУ
-    # (`"ok":true`), а не по коду ответа, потому что `/` отдаёт 302 одинаково
-    # и у живого приложения, и у голого прокси перед мёртвым бэкендом.
+    # What covers a failed deployment instead: `verify:team-relay` in the
+    # deploy pipeline goes red on its own — it checks `/health` by CONTENT
+    # (`"ok":true`) rather than by response code, because `/` answers 302
+    # identically for a live application and for a bare proxy in front of a
+    # dead backend.
     #
-    # ⚠️ Честная граница этого моста: `deploy:team-relay` клонирует
-    # `--branch ${PRODUCT_REF:-main}`, то есть выкатывает `main` НА МОМЕНТ
-    # КЛОНА, а не тот коммит, что поднял триггер. При двух мёржах подряд
-    # обе выкатки привезут второй коммит. Для догоняющей выкатки это
-    # безобидно, но означает, что «джоба зелёная» не доказывает, что на проде
-    # именно этот коммит — доказывает `verify:team-relay` и сторож дрейфа.
+    # ⚠️ The honest boundary of this bridge: `deploy:team-relay` clones
+    # `--branch ${PRODUCT_REF:-main}`, i.e. it ships `main` AS OF THE CLONE,
+    # not the commit that fired the trigger. With two merges in quick
+    # succession both deployments carry the second commit. That is harmless for
+    # a catch-up deployment, but it means "the job is green" does not prove
+    # that this exact commit is in production — `verify:team-relay` and the
+    # drift watchdog prove that.

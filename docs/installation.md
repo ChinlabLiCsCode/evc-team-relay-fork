@@ -24,9 +24,7 @@ This guide covers installing EVC Team Relay on a Linux server using Docker Compo
 Silicon, AWS Graviton, Ampere at Hetzner/OVH, or Raspberry Pi; Docker
 pulls the manifest matching your host automatically, and
 `scripts/pull-published-images.sh` (step 6 below) picks the right one on
-its own for the two images it handles. `relay-server` is pulled later, by
-`docker compose up` itself in step 7 — same automatic manifest match,
-no platform pin, nothing to export.
+its own for all three images — no platform pin, nothing to export.
 
 ### Ports
 
@@ -86,8 +84,10 @@ Edit `relay/relay.toml`:
   `RELAY_AUDIENCE` unset, must equal `https://${DOMAIN_BASE}` — the default control-plane
   derives from `RELAY_PUBLIC_URL`'s host). A mismatch here fails silently: tokens are issued
   and signed correctly but every WebSocket connection is rejected with no useful log line.
-  Remember there is no separate `relay.` subdomain (step 4 below) — this is
-  `https://yourdomain.com`, not `https://relay.yourdomain.com`.
+  On the default single-domain install this is `https://yourdomain.com`. Putting the relay
+  on its own subdomain instead is also supported (step 4 below) — in that case this is
+  `https://relay.yourdomain.com`, matching `RELAY_DOMAIN`; see
+  [Running behind an external proxy](reverse-proxy.md) for the full subdomain layout.
 - `[store]` — MinIO credentials from `.env` (`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`).
 - `[[auth]]` — `key_id` matches `RELAY_KEY_ID` in `.env` if you set one (defaults to `relay_cp_dev`
   if omitted); `public_key` is the Ed25519 public key derived from the private key you generated
@@ -105,7 +105,7 @@ Edit `relay/relay.toml`:
 
 ### 4. Configure DNS
 
-`DOMAIN_BASE` itself is the relay server's domain — there is no separate `relay.` subdomain.
+On the default single-domain install, `DOMAIN_BASE` itself is the relay server's domain.
 Point these DNS records to your server IP:
 
 | Record | Type | Value |
@@ -113,6 +113,10 @@ Point these DNS records to your server IP:
 | `yourdomain.com` (i.e. your `DOMAIN_BASE`) | A | Your server IP |
 | `cp.yourdomain.com` | A | Your server IP |
 | `docs.yourdomain.com` | A | Your server IP (optional, for web publishing) |
+
+> If you set `RELAY_DOMAIN` to its own subdomain instead of the bare domain (see
+> [Running behind an external proxy](reverse-proxy.md)), add an `A` record for that
+> hostname too, pointing at the same server IP.
 
 ### 5. Review Caddy Configuration
 
@@ -148,22 +152,22 @@ This allows the Obsidian plugin (and other browser-based clients) to authenticat
 
 ### 6. Pull the Published Images
 
-`web-publish` builds from source only with a GitHub token scoped to our private
-`@entire-vc/*` packages — not available outside the org. Pull the images the release
-workflow already publishes publicly instead (run from the repo root, one level up from
-`infra/`):
+Building from source works — the `@entire-vc/*` packages `web-publish` depends on are
+published on the public npm registry, so no credential is involved. Pulling the images the
+release workflow already published is simply faster and gets you the exact bytes that were
+tested (run from the repo root, one level up from `infra/`):
 
 ```bash
 bash scripts/pull-published-images.sh
 ```
 
-This tags them locally as `infra-control-plane:latest` / `infra-web-publish:latest`, which
-`docker compose up` picks up without attempting to build. Pass a version to pin one
-(`bash scripts/pull-published-images.sh 1.10.0`) instead of the default `latest`.
+This tags them locally as `infra-control-plane:latest` / `infra-relay-server:latest` /
+`infra-web-publish:latest`, which `docker compose up` picks up without attempting to
+build. Pass a version to pin one (`bash scripts/pull-published-images.sh 1.10.0`)
+instead of the default `latest`.
 
 > **arm64 hosts:** nothing to do here — the script pulls the native `linux/arm64` build
-> of both images automatically. `relay-server` in step 7 is native `linux/arm64` too,
-> pulled directly by `docker compose up` with no platform pin; see
+> of all three images automatically, with no platform pin anywhere; see
 > [Architecture](#architecture) above.
 
 If you do have org access and want to build from source instead (e.g. active development),
@@ -268,10 +272,10 @@ docker compose up -d --build
 
 ### With Pre-built Images
 
-`docker compose pull` won't work here — `control-plane`/`web-publish` are tagged locally
-(`infra-control-plane:latest`/`infra-web-publish:latest`, not a registry reference), by design
-so the same compose file works whether you build from source or pull. Re-run the pull script
-instead:
+`docker compose pull` won't work here — `control-plane`/`relay-server`/`web-publish` are
+tagged locally (`infra-control-plane:latest`/`infra-relay-server:latest`/`infra-web-publish:latest`,
+not a registry reference), by design so the same compose file works whether you build from
+source or pull. Re-run the pull script instead:
 
 ```bash
 bash scripts/pull-published-images.sh [version]
@@ -316,6 +320,17 @@ Ensure DNS records are properly configured and ports 80/443 are accessible.
 docker compose exec control-plane curl -s http://localhost:8000/health
 docker compose exec relay-server curl -s http://localhost:9090/metrics | head -5
 ```
+
+### Shares Visible, Content Not Syncing
+
+Login and the share list work, but document contents never arrive or seem to
+disappear later. This means the control plane (shares, membership) is healthy
+but the relay/storage path (`relay-server` + MinIO) is not — health checks
+don't cover that path at all. See
+[Running behind an external proxy](reverse-proxy.md#6-verify-by-outcome-not-by-health-check)
+for the two commands that verify it directly, and check `relay/relay.toml`
+against `.env` — `relay-server` does not read `.env` at all, so the two files
+can silently disagree.
 
 ## Next Steps
 

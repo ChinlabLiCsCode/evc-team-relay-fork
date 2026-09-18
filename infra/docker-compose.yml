@@ -16,7 +16,10 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio:latest
+    # Docker Hub's minio/minio repo now denies anonymous pulls (denied:
+    # requested access to the resource is denied) — use MinIO's own quay.io
+    # mirror instead, which is unauthenticated and tag-for-tag identical.
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     env_file:
       - ./.env
@@ -68,7 +71,7 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     env_file:
       - ./.env
     depends_on:
@@ -261,10 +264,18 @@ services:
         condition: service_completed_successfully
 
   relay-server:
-    image: ghcr.io/entire-vc/evc-relay-server:0.9.12
-    # Third-party image; publishes linux/amd64 + linux/arm64 as of 0.9.12 —
-    # no platform pin needed, Docker picks the manifest matching the host
-    # automatically, same as control-plane/web-publish.
+    build:
+      context: ../apps/relay-server
+      dockerfile: Dockerfile
+    image: infra-relay-server:latest
+    # Our own image, same shape as control-plane/web-publish above: the local
+    # tag is what scripts/pull-published-images.sh writes after pulling
+    # ghcr.io/entire-vc/evc-team-relay/relay-server:<version>, and `build:`
+    # stays for building from source. It used to pin the third-party fork
+    # ghcr.io/entire-vc/evc-relay-server:0.9.12, which meant release.yml's
+    # smoke-test booted an image the release had not built. Publishes
+    # linux/amd64 + linux/arm64, so no platform pin is needed — Docker picks
+    # the manifest matching the host automatically.
     depends_on:
       minio:
         condition: service_healthy

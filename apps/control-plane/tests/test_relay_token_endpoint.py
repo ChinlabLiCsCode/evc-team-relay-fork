@@ -148,6 +148,54 @@ class TestRelayTokenHappyPath:
         )
         assert resp.status_code == 200
 
+    def test_client_version_recorded_in_audit_log(self, client: TestClient, db_session):
+        """client_version is optional but, when sent, lands in the token_issued
+        audit log's details — the only signal that can attribute a token to a
+        specific plugin release, since User-Agent carries the Obsidian/Electron
+        app version rather than the plugin's (#75491f2f recurrence diagnosis).
+        """
+        token = login(client, "bootstrap@example.com", "super-secret")
+        share_id = create_share(client, token)
+
+        resp = client.post(
+            "/tokens/relay",
+            json={
+                "share_id": share_id,
+                "doc_id": share_id,
+                "mode": "read",
+                "client_version": "0.0.9",
+            },
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200
+
+        stmt = select(models.AuditLog).where(
+            models.AuditLog.action == models.AuditAction.TOKEN_ISSUED
+        )
+        audit_logs = list(db_session.execute(stmt).scalars().all())
+        assert audit_logs, "expected a TOKEN_ISSUED audit log entry"
+        assert audit_logs[-1].details.get("client_version") == "0.0.9"
+
+    def test_client_version_omitted_when_not_sent(self, client: TestClient, db_session):
+        """Older clients that don't send client_version at all must not break
+        issuance, and must not get a spurious key in the audit details."""
+        token = login(client, "bootstrap@example.com", "super-secret")
+        share_id = create_share(client, token)
+
+        resp = client.post(
+            "/tokens/relay",
+            json={"share_id": share_id, "doc_id": share_id, "mode": "read"},
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200
+
+        stmt = select(models.AuditLog).where(
+            models.AuditLog.action == models.AuditAction.TOKEN_ISSUED
+        )
+        audit_logs = list(db_session.execute(stmt).scalars().all())
+        assert audit_logs
+        assert "client_version" not in audit_logs[-1].details
+
     def test_token_is_valid_cwt(self, client: TestClient):
         """Returned token must be a valid CWT with correct structure."""
         admin_token = login(client, "bootstrap@example.com", "super-secret")

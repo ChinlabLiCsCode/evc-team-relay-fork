@@ -51,6 +51,15 @@ def validate_share_path_safety(path: str, kind: models.ShareKind) -> None:
 
     Raises HTTPException if path is unsafe or invalid format.
     """
+    # Empty string is the canonical "whole vault" representation for FOLDER
+    # shares (#1f27561a) — there is no other safe spelling: an absolute "/"
+    # (what Obsidian's vault-root TFolder.path literally is) stays rejected
+    # below since it's genuinely ambiguous with a filesystem absolute path.
+    # Every other check in this function is either inapplicable to "" or
+    # would reject it for the wrong reason, so return immediately.
+    if path == "" and kind == models.ShareKind.FOLDER:
+        return
+
     if not path or path.strip() == "":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path cannot be empty")
 
@@ -135,6 +144,36 @@ def create_share(
 ) -> models.Share:
     # Validate path safety and format
     validate_share_path_safety(payload.path, payload.kind)
+
+    # Reject an EXACT duplicate: same owner + same kind + byte-identical path.
+    # Overlapping-but-different folder shares stay legal on purpose (a root
+    # share at path="" overlaps every other folder share, and carving a
+    # narrower folder out of a broad one with different visibility is a
+    # supported pattern) — find_share_for_path resolves those by
+    # "most specific wins". An exact duplicate is the one case that has no
+    # legitimate use and no deterministic resolution: two rows with identical
+    # path length make that function's max() tie-break arbitrary, so which of
+    # the two visibilities applies depends on DB row order.
+    #
+    # Compared with == against payload.path directly because nothing
+    # normalizes the path on the way in: the schema declares it a plain str
+    # and validate_share_path_safety only validates, so what lands in
+    # Share.path is byte-identical to the request. (find_share_for_path
+    # strip("/")-es at read time, but that is a read-side concern and
+    # normalizing here instead would change what gets persisted.)
+    duplicate_stmt = select(models.Share.id).where(
+        models.Share.owner_user_id == owner.id,
+        models.Share.kind == payload.kind,
+        models.Share.path == payload.path,
+    )
+    # .first(), not scalar_one_or_none(): rows predating this check may already
+    # contain duplicates, and that must surface as this 409 rather than as a
+    # MultipleResultsFound 500.
+    if db.execute(duplicate_stmt).first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A share already exists at this exact path",
+        )
 
     # TR-39: a share can't carry content at creation time (ShareCreate has no
     # content field — it's added via a later update), so public+published at
@@ -868,10 +907,18 @@ def validate_path_within_folder(folder_path: str, file_path: str) -> bool:
         validate_path_within_folder("Projects/", "Projects/sub/doc.md") -> True
         validate_path_within_folder("Projects/", "Other/doc.md") -> False
         validate_path_within_folder("Projects/", "Projects") -> False (exact match, not within)
+        validate_path_within_folder("", "Anything/doc.md") -> True (root share = whole vault)
     """
     # Normalize paths: remove leading/trailing slashes
     folder_path = folder_path.strip("/")
     file_path = file_path.strip("/")
+
+    # Root share ("" = whole vault, #1f27561a) contains every real file path.
+    # Handle this before the "/" suffix logic below, which would otherwise
+    # normalize "" to "/" and then reject every file_path (file_path is
+    # stripped of its own leading "/" above, so it can never start with "/").
+    if folder_path == "":
+        return bool(file_path)
 
     # Ensure folder path ends with / for proper prefix matching
     if not folder_path.endswith("/"):
